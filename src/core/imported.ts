@@ -336,6 +336,125 @@ export function moveSeam(
   return { points: out, moved, open, ends: 0 };
 }
 
+/**
+ * A loop (points without the repeated closing one) started from its point nearest to `near`, on a
+ * side if need be, and closed again on that point.
+ */
+function loopFrom(loop: PathPoint[], near: [number, number]): PathPoint[] {
+  let best = { d: Infinity, i: 0, t: 0 };
+  for (let i = 0; i < loop.length; i++) {
+    const [a, b] = [loop[i], loop[(i + 1) % loop.length]];
+    const [dx, dy] = [b.x - a.x, b.y - a.y];
+    const l2 = dx * dx + dy * dy;
+    const t = l2 ? Math.max(0, Math.min(1, ((near[0] - a.x) * dx + (near[1] - a.y) * dy) / l2)) : 0;
+    const d = Math.hypot(a.x + t * dx - near[0], a.y + t * dy - near[1]);
+    if (d < best.d) best = { d, i, t };
+  }
+  const [a, b] = [loop[best.i], loop[(best.i + 1) % loop.length]];
+  const side = Math.hypot(b.x - a.x, b.y - a.y);
+  const start = best.t * side < CLOSE ? best.i : (1 - best.t) * side < CLOSE ? (best.i + 1) % loop.length : -1;
+  const ring: PathPoint[] = [];
+  if (start >= 0) for (let k = 0; k <= loop.length; k++) ring.push({ ...loop[(start + k) % loop.length], e: true });
+  else {
+    const on: PathPoint = { ...a, x: a.x + best.t * (b.x - a.x), y: a.y + best.t * (b.y - a.y), z: a.z + best.t * (b.z - a.z), e: true };
+    ring.push(on);
+    for (let k = 1; k <= loop.length; k++) ring.push({ ...loop[(best.i + k) % loop.length], e: true });
+    ring.push({ ...on });
+  }
+  return ring;
+}
+
+/**
+ * The curves of a path put in the order they are best printed, without changing any of them:
+ *  - flat curves (each at one height) go from the lowest up; at the same height, the nearest first;
+ *    curves that are not flat (passes over a surface) keep the order they have;
+ *  - every closed curve starts from its point nearest to where the one before ended (the first
+ *    one nearest to `target`, when given), and flat closed curves all turn the same way round
+ *    (`direction`); an open curve starts from its end nearest to where the one before ended;
+ *  - the move from one curve to the next is printed when no longer than `join` (and, between
+ *    levels, when it climbs no more than the usual step between them), otherwise made with the
+ *    extruder off.
+ * `ranges`: the point ranges of the curves, in the order of the path. Returns the new points, the
+ * new first index of every curve, and the moves with the extruder off before and after.
+ */
+export function reorderPath(
+  pts: PathPoint[],
+  ranges: [number, number][],
+  opts: { join: number; target?: [number, number]; direction?: 'ccw' | 'cw' },
+): { points: PathPoint[]; breaks: Uint32Array; before: number; after: number; sorted: boolean } | null {
+  const n = pts.length;
+  const whole = ranges.length > 0 && ranges[0][0] === 0 && ranges[ranges.length - 1][1] === n - 1 && ranges.every((r, k) => k === 0 || r[0] === ranges[k - 1][1] + 1);
+  if (!whole) return null;
+  const curves = ranges.map(([from, to]) => {
+    let [lo, hi] = [Infinity, -Infinity];
+    for (let i = from; i <= to; i++) {
+      lo = Math.min(lo, pts[i].z);
+      hi = Math.max(hi, pts[i].z);
+    }
+    const gap = Math.hypot(pts[to].x - pts[from].x, pts[to].y - pts[from].y, pts[to].z - pts[from].z);
+    const closed = to - from >= 3 && gap < CLOSE;
+    // Signed area in plan (counter-clockwise > 0), for flat closed curves.
+    let area = 0;
+    if (closed) for (let i = from; i < to; i++) area += pts[i].x * pts[i + 1].y - pts[i + 1].x * pts[i].y;
+    return { from, to, lo, flat: hi - lo < 0.05, closed, ccw: area > 0, done: false };
+  });
+  const sorted = curves.every((c) => c.flat);
+  // Printing order: by height when every curve is flat (levels 0.05 mm apart are one level).
+  const levels: (typeof curves)[] = [];
+  if (sorted) {
+    for (const c of [...curves].sort((a, b) => a.lo - b.lo)) {
+      const last = levels[levels.length - 1];
+      if (last && c.lo - last[0].lo < 0.05) last.push(c);
+      else levels.push([c]);
+    }
+  } else for (const c of curves) levels.push([c]);
+  // The usual step from one level to the next: a printed move never climbs much more than that
+  // (a larger gap in height is no layer change — printing across it would lay a bead in the air).
+  const steps = levels.slice(1).map((l, k) => l[0].lo - levels[k][0].lo).sort((a, b) => a - b);
+  const climb = sorted && steps.length ? 1.5 * steps[Math.floor(steps.length / 2)] + 0.01 : Infinity;
+
+  const out: PathPoint[] = [];
+  const breaks: number[] = [];
+  let cur: [number, number] | null = opts.target ?? null;
+  let after = 0;
+  const end = (c: (typeof curves)[number], which: 0 | 1): PathPoint => pts[which ? c.to : c.from];
+  for (const level of levels) {
+    for (let left = level.length; left > 0; left--) {
+      // The curve of this level nearest to where the nozzle is (any point of a loop, an end of a line).
+      let pick = level.find((c) => !c.done)!;
+      if (cur && level.length > 1) {
+        let bd = Infinity;
+        for (const c of level) {
+          if (c.done) continue;
+          let d = Infinity;
+          if (c.closed) for (let i = c.from; i < c.to; i++) d = Math.min(d, Math.hypot(pts[i].x - cur[0], pts[i].y - cur[1]));
+          else d = Math.min(Math.hypot(end(c, 0).x - cur[0], end(c, 0).y - cur[1]), Math.hypot(end(c, 1).x - cur[0], end(c, 1).y - cur[1]));
+          if (d < bd) [bd, pick] = [d, c];
+        }
+      }
+      pick.done = true;
+      let run: PathPoint[];
+      if (pick.closed) {
+        let loop = pts.slice(pick.from, pick.to);
+        if (pick.flat && opts.direction && (opts.direction === 'ccw') !== pick.ccw) loop = loop.reverse();
+        run = cur ? loopFrom(loop, cur) : [...loop.map((q) => ({ ...q, e: true })), { ...loop[0], e: true }];
+      } else {
+        run = pts.slice(pick.from, pick.to + 1).map((q) => ({ ...q, e: true }));
+        if (cur && Math.hypot(run[run.length - 1].x - cur[0], run[run.length - 1].y - cur[1]) < Math.hypot(run[0].x - cur[0], run[0].y - cur[1])) run.reverse();
+      }
+      const last = out[out.length - 1];
+      run[0].e = !!last && Math.hypot(run[0].x - last.x, run[0].y - last.y, run[0].z - last.z) <= opts.join && Math.abs(run[0].z - last.z) <= climb;
+      if (last && !run[0].e) after++;
+      breaks.push(out.length);
+      for (const q of run) out.push(q);
+      cur = [run[run.length - 1].x, run[run.length - 1].y];
+    }
+  }
+  let before = 0;
+  for (let i = 1; i < n; i++) if (!pts[i].e) before++;
+  return { points: out, breaks: Uint32Array.from(breaks), before, after, sorted };
+}
+
 type V3 = [number, number, number];
 
 /**

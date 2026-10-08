@@ -477,3 +477,33 @@ test('a Rhino file with the path and its object: the object is only a reference,
   expect(Math.max(...z)).toBe(44);
 });
 
+test('the curves of an imported path can be put in printing order with one button', async ({ page }) => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const rhino = (await ((await import('rhino3dm')).default as any)()) as any;
+  const doc = new rhino.File3dm();
+  // six square loops saved from the top down, each written from a different corner
+  const corners = [[0, 0], [80, 0], [80, 80], [0, 80]];
+  for (let k = 5; k >= 0; k--) {
+    const pl = new rhino.Polyline();
+    for (let i = 0; i <= 4; i++) pl.add(1400 + corners[(k + i) % 4][0], -500 + corners[(k + i) % 4][1], 45 + 1.5 * k);
+    doc.objects().addCurve(pl.toPolylineCurve(), null);
+  }
+  await page.setInputFiles('#file', { name: 'disordinato.3dm', mimeType: 'application/octet-stream', buffer: Buffer.from(doc.toByteArray()) });
+  await expect(download(page)).toBeEnabled({ timeout: 30_000 });
+  // as saved: the nozzle jumps onto every loop
+  await expect(stat(page, 'Modo scelto')).toContainText('5 spostamenti con estrusore spento');
+  await expect(page.locator('#reorderBtn')).toBeVisible();
+  await page.locator('#reorderBtn').click();
+  await expect(page.locator('#warnings')).toContainText('Percorso riordinato: 6 curve dal basso verso l’alto');
+  await expect(page.locator('#warnings')).toContainText('Spostamenti a estrusore spento: 0 (nell’ordine del file erano 5)');
+  await expect(stat(page, 'Modo scelto')).toContainText('Estrusore mai fermo');
+  await expect(download(page)).toBeEnabled();
+  const [dl] = await Promise.all([page.waitForEvent('download'), download(page).click()]);
+  const z = readFileSync((await dl.path())!, 'utf8').split('\r\n').filter((l) => l.startsWith('LIN {')).map((l) => parseFloat(/Z (-?[\d.]+)/.exec(l)![1]));
+  expect(z).toEqual([...z].sort((a, b) => a - b)); // bottom first, never down again
+  // the same setting as the field in «Stampa»; pressed again, the file is taken as it is
+  await expect(page.locator('#printFields label').filter({ hasText: 'Riordina le curve' }).locator('input')).toBeChecked();
+  await page.locator('#reorderBtn').click();
+  await expect(stat(page, 'Modo scelto')).toContainText('5 spostamenti con estrusore spento');
+});
+

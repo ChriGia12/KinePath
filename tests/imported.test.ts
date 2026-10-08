@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { cellBodies, type CellPart } from '../src/core/collision';
 import rhino3dm from 'rhino3dm';
-import { curvesToPath, moveSeam, parseSrc, pathProxy, pathUnits, tiltFromPath, importedToolpath } from '../src/core/imported';
+import { curvesToPath, moveSeam, parseSrc, pathProxy, pathUnits, reorderPath, tiltFromPath, importedToolpath } from '../src/core/imported';
 import { parse3dm } from '../src/core/loaders';
 import type { PathPoint } from '../src/core/toolpath';
 import { computeBounds, IDENTITY, weld, type Mat3 } from '../src/core/mesh';
@@ -266,6 +266,94 @@ describe('an imported path can be changed, not only copied', () => {
     const tube = importedToolpath(Array.from({ length: 10 }, (_, k) => ring(60, 0.5 + 1.5 * k, k === 0)).flat(), DEFAULT_PRINT, true);
     expect(tiltFromPath(tube, DEFAULT_PRINT)).toBe(0);
     expect(tube.points.every((p) => Math.abs(p.c! - 180) < 0.5)).toBe(true);
+  });
+});
+
+describe('the curves of an imported path put in printing order', () => {
+  const pt = (p: PathPoint[]) => p.map((q) => [q.x, q.y, q.z]);
+  /** A square loop 80 mm wide at height z, written from corner `from`, clockwise or not. */
+  const square = (z: number, from: number, cw = false, size = 80): Float32Array => {
+    const c = [[0, 0], [size, 0], [size, size], [0, size]];
+    const order = Array.from({ length: 5 }, (_, k) => c[(from + (cw ? -k : k) + 8) % 4]);
+    return Float32Array.from(order.flatMap(([x, y]) => [x, y, z]));
+  };
+  const toPts = (curves: Float32Array[], join = 8) => {
+    const path = curvesToPath(curves, join)!;
+    const pts: PathPoint[] = Array.from({ length: path.xyz.length / 3 }, (_, i) => ({ x: path.xyz[i * 3], y: path.xyz[i * 3 + 1], z: path.xyz[i * 3 + 2], e: !!path.ext[i] }));
+    const b = [...path.breaks!];
+    return { pts, ranges: b.map((f, k): [number, number] => [f, (b[k + 1] ?? pts.length) - 1]) };
+  };
+  const off = (p: PathPoint[]) => p.filter((q, i) => i > 0 && !q.e).length;
+
+  it('loops saved top first, each from a different corner and some the other way round: bottom first, one line', () => {
+    // five layers, saved from the top down; start corners all over, every other loop clockwise
+    const { pts, ranges } = toPts([4, 3, 2, 1, 0].map((k) => square(1 + 1.5 * k, k % 4, k % 2 === 1)));
+    expect(off(pts)).toBe(4); // as saved: a jump onto every loop
+    const r = reorderPath(pts, ranges, { join: 8, direction: 'ccw' })!;
+    expect(r.sorted).toBe(true);
+    expect([r.before, r.after]).toEqual([4, 0]);
+    expect(off(r.points)).toBe(0);
+    // lowest first, never down again
+    const zs = r.points.map((q) => q.z);
+    expect(zs).toEqual([...zs].sort((a, b) => a - b));
+    // every loop starts right above where the one below started, and is whole: same corners
+    const firsts = [...r.breaks].map((i) => [r.points[i].x, r.points[i].y]);
+    expect(new Set(firsts.map((f) => f.join())).size).toBe(1);
+    for (const z of [1, 2.5, 4, 5.5, 7]) {
+      const loop = r.points.filter((q) => q.z === z);
+      expect(new Set(loop.map((q) => `${q.x},${q.y}`)).size).toBe(4);
+      expect(loop.length).toBe(5);
+      // all counter-clockwise
+      let a = 0;
+      for (let i = 1; i < loop.length; i++) a += loop[i - 1].x * loop[i].y - loop[i].x * loop[i - 1].y;
+      expect(a).toBeGreaterThan(0);
+    }
+  });
+
+  it('two walls per layer: the nearer one first, both before going up', () => {
+    const inner = (z: number) => Float32Array.from([[5, 5], [75, 5], [75, 75], [5, 75], [5, 5]].flatMap(([x, y]) => [x, y, z]));
+    const { pts, ranges } = toPts([square(1, 2), inner(1), square(2.5, 0), inner(2.5)]);
+    const r = reorderPath(pts, ranges, { join: 8, target: [80, 80] })!;
+    expect(r.after).toBe(0);
+    // starts at the corner chosen, and a level is finished before the next one begins
+    expect(pt(r.points)[0]).toEqual([80, 80, 1]);
+    const zs = r.points.map((q) => q.z);
+    expect(zs).toEqual([...zs].sort((a, b) => a - b));
+    expect(r.points.filter((q) => q.z === 1).length).toBe(10);
+  });
+
+  it('a gap in height larger than a layer is not printed across', () => {
+    // a loop 6 mm below the rest (layers 1.5 mm apart): the nozzle goes up with the extruder off
+    const { pts, ranges } = toPts([square(1, 0), square(7, 0), square(8.5, 0), square(10, 0)]);
+    const r = reorderPath(pts, ranges, { join: 8 })!;
+    expect(r.after).toBe(1);
+    const up = r.points.findIndex((q) => q.z === 7);
+    expect(r.points[up].e).toBe(false);
+  });
+
+  it('passes over a surface are not flat: their order is kept, each starts from its nearer end', () => {
+    // four passes all drawn left to right on a slope: as saved, a jump back before every pass
+    const passes = [0, 1, 2, 3].map((k) => Float32Array.from([0, 100].flatMap((x) => [x, k * 6, 5 + x * 0.2])));
+    const { pts, ranges } = toPts(passes);
+    expect(off(pts)).toBe(3);
+    const r = reorderPath(pts, ranges, { join: 8 })!;
+    expect(r.sorted).toBe(false);
+    expect(r.after).toBe(0);
+    expect(r.points.filter((_, i) => i % 2 === 0).map((q) => q.y)).toEqual([0, 6, 12, 18]);
+    expect(r.points.map((q) => q.x)).toEqual([0, 100, 100, 0, 0, 100, 100, 0]); // back and forth
+  });
+
+  it('through the build: off by default (the file as it is), on when asked, and said in the result', () => {
+    const curves = [4, 3, 2, 1, 0].map((k) => square(1 + 1.5 * k, k % 4));
+    const path = curvesToPath(curves, 8)!;
+    const asIs = runBuild(pathProxy(path, DEFAULT_PRINT), I, DEFAULT_PRINT, DEFAULT_ROBOT, 'p.3dm', bodies, undefined, undefined, [path]);
+    expect(asIs.toolpath.travels).toBe(4);
+    const print = { ...DEFAULT_PRINT, importedReorder: true };
+    const r = runBuild(pathProxy(path, print), I, print, DEFAULT_ROBOT, 'p.3dm', bodies, undefined, undefined, [path]);
+    expect(r.toolpath.travels).toBe(0);
+    expect(r.toolpath.warnings.find((w) => w.k === 'i.reordered')?.p).toMatchObject({ n: 5, before: 4, after: 0 });
+    expect(r.errors).toEqual([]);
+    expect(r.collision?.count).toBe(0);
   });
 });
 
