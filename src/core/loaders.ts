@@ -28,7 +28,15 @@ export interface LoadedModel {
   notes: Msg[];
   /** Curves of the file as polylines (x, y, z triples, mm), in the order of the file. */
   curves?: Float32Array[];
+  /**
+   * The curves come from a layer named as a path (PATH_LAYER): they are the path to print even
+   * when the file holds solids too (a whole Rhino scene with the path baked into it).
+   */
+  pathLayer?: string;
 }
+
+/** A layer with one of these words in its name holds the path to print. */
+export const PATH_LAYER = /percorso|toolpath|kinepath/i;
 
 function fromGeometry(g: BufferGeometry): MeshData {
   const pos = g.getAttribute('position');
@@ -140,6 +148,8 @@ export function parse3dm(rhino: Any, bytes: Uint8Array): LoadedModel {
 
   const parts: ModelPart[] = [];
   const curves: Float32Array[] = [];
+  const pathCurves: Float32Array[] = [];
+  let pathLayer: string | undefined;
   let skipped = 0;
   let blocks = 0;
   let brepsNoMesh = 0;
@@ -174,8 +184,15 @@ export function parse3dm(rhino: Any, bytes: Uint8Array): LoadedModel {
       if (d) meshes.push(d);
     } else if (type === rhino.ObjectType.Curve) {
       const c = curvePoints(g);
-      if (c) curves.push(unitScale === 1 ? c : c.map((v) => v * unitScale));
-      else skipped++;
+      if (c) {
+        const scaled = unitScale === 1 ? c : c.map((v) => v * unitScale);
+        curves.push(scaled);
+        const name = layers[attr.layerIndex]?.path ?? '';
+        if (PATH_LAYER.test(name)) {
+          pathCurves.push(scaled);
+          pathLayer ??= name;
+        }
+      } else skipped++;
       continue;
     } else if (type === rhino.ObjectType.InstanceReference) {
       blocks++;
@@ -204,6 +221,8 @@ export function parse3dm(rhino: Any, bytes: Uint8Array): LoadedModel {
   if (unitScale !== 1) notes.push(msg('n.units', { s: unitScale }));
   // A file of curves only is a path made by hand (imported.ts); with solids too, the solids are the part.
   if (!parts.length && !curves.length) throw new MsgError(msg('e.3dmEmpty'));
+  // Curves in a layer named as a path are the path, whatever else the file holds.
+  if (pathLayer) return { format: '3DM', parts, notes, curves: pathCurves, pathLayer };
   if (parts.length && curves.length) notes.push(msg('n.curvesIgnored', { n: curves.length }));
   return { format: '3DM', parts, notes, curves };
 }

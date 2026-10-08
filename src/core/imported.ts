@@ -295,20 +295,21 @@ export function tiltFromPath(tp: Toolpath, s: Pick<PrintSettings, 'maxTilt' | 'l
 }
 
 /**
- * Curves (polylines as x, y, z triples) as a path: each curve is printed, in the order given; the
- * move from the end of one to the start of the next is made with the extruder off, unless the
- * next curve starts right where the previous one ended.
+ * Curves (polylines as x, y, z triples) as a path: each curve is printed, in the order given. The
+ * move from the end of one to the start of the next is printed too when it is no longer than
+ * `join` (the step up to the next layer of a path drawn layer by layer); a longer one is made
+ * with the extruder off.
  */
-export function curvesToPath(curves: ArrayLike<number>[]): ImportedPath | null {
+export function curvesToPath(curves: ArrayLike<number>[], join = 0): ImportedPath | null {
   const xyz: number[] = [];
   const ext: number[] = [];
   for (const c of curves) {
     for (let i = 0; i + 2 < c.length; i += 3) {
       const n = xyz.length;
-      const same = n > 0 && Math.hypot(xyz[n - 3] - c[i], xyz[n - 2] - c[i + 1], xyz[n - 1] - c[i + 2]) < 1e-3;
-      if (same) continue;
+      const hop = n ? Math.hypot(xyz[n - 3] - c[i], xyz[n - 2] - c[i + 1], xyz[n - 1] - c[i + 2]) : Infinity;
+      if (hop < 1e-3) continue;
       xyz.push(c[i], c[i + 1], c[i + 2]);
-      ext.push(i === 0 ? 0 : 1);
+      ext.push(i === 0 ? (hop <= join ? 1 : 0) : 1);
     }
   }
   if (xyz.length < 6) return null;

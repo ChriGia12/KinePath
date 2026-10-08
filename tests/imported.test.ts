@@ -217,8 +217,34 @@ describe('a path drawn as curves in a Rhino file', async () => {
     for (let i = 0; i < circle.length; i += 3) expect(Math.abs(Math.hypot(circle[i], circle[i + 1]) - 20)).toBeLessThan(0.05);
     const path = curvesToPath(model.curves!)!;
     // every curve printed, the move onto a curve with the extruder off
-    const starts = [...path.ext].map((e, i) => (e ? -1 : i)).filter((i) => i >= 0);
-    expect(starts).toEqual([0, 5, 8]);
+    const starts = (p: { ext: Uint8Array }) => [...p.ext].map((e, i) => (e ? -1 : i)).filter((i) => i >= 0);
+    expect(starts(path)).toEqual([0, 5, 8]);
+    // a short step to the next curve (1.5 mm up to the next layer) is printed: the extruder stays on
+    expect(starts(curvesToPath(model.curves!, 8)!)).toEqual([0, 8]);
+  });
+
+  it('curves in a layer named «Percorso» are the path even in a file with solids and other curves', () => {
+    const doc = new rhino.File3dm();
+    for (const name of ['Predefinita', 'Percorso stampa']) {
+      const layer = new rhino.Layer();
+      layer.name = name;
+      doc.layers().add(layer);
+    }
+    const onPath = new rhino.ObjectAttributes();
+    onPath.layerIndex = doc.layers().count - 1;
+    // a guide curve on the default layer, then two path curves, then a solid
+    doc.objects().addCurve(polyline([[0, 0, 0], [500, 0, 0], [500, 500, 0]]), null);
+    doc.objects().addCurve(polyline([[0, 0, 1], [50, 0, 1], [50, 50, 1], [0, 50, 1], [0, 0, 1]]), onPath);
+    doc.objects().addCurve(polyline([[0, 0, 2.5], [50, 0, 2.5], [50, 50, 2.5], [0, 50, 2.5], [0, 0, 2.5]]), onPath);
+    const m = new rhino.Mesh();
+    for (const v of [[0, 0, 0], [10, 0, 0], [0, 10, 0], [0, 0, 10]]) m.vertices().add(v[0], v[1], v[2]);
+    for (const f of [[0, 2, 1], [0, 1, 3], [1, 2, 3], [0, 3, 2]]) m.faces().addTriFace(f[0], f[1], f[2]);
+    doc.objects().addMesh(m, null);
+    const model = parse3dm(rhino, new Uint8Array(doc.toByteArray()));
+    expect(model.pathLayer).toBe('Percorso stampa');
+    expect(model.curves!.length).toBe(2);
+    expect(model.notes.map((n) => n.k)).not.toContain('n.curvesIgnored');
+    expect(curvesToPath(model.curves!)!.xyz.length / 3).toBe(10);
   });
 
   it('with a solid in the file the solid is the part, and the curves are reported', () => {

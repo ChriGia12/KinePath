@@ -112,6 +112,8 @@ interface Part {
    */
   path?: ImportedPath;
   beads?: string;
+  /** The curves the path was made from (a Rhino file): the path follows «Salto senza stop». */
+  curves?: Float32Array[];
 }
 let parts: Part[] = [];
 let active = -1;
@@ -231,7 +233,7 @@ const cellRegion = (): CellRegion => ({
 });
 
 /** The settings the beads of an imported path are drawn with. */
-const beadsKey = () => `${print.wallSpacing}|${print.layerHeight}|${print.firstLayerZ}`;
+const beadsKey = () => `${print.wallSpacing}|${print.layerHeight}|${print.firstLayerZ}|${print.maxBridge}`;
 
 /** An imported path has one way to lie: as it was made. */
 const asMade = (): OrientationCandidate => ({
@@ -280,11 +282,13 @@ async function readPart(name: string, bytes: ArrayBuffer): Promise<Part> {
     return pathPart(path, 'KRL', msg(path.hasExtruder ? 'n.importedPath' : 'n.importedPathAllOn', { n: path.xyz.length / 3 }));
   }
   const model = await busy(t('busy.read', { name }), () => loadModel(new File([bytes], name)));
-  // A Rhino file of curves only: the curves are the path, one after the other.
-  if (!model.parts.length && model.curves?.length) {
-    const path = curvesToPath(model.curves);
+  // A Rhino file of curves only, or with its curves in a layer named as a path: the curves are
+  // the path, one after the other.
+  if (model.curves?.length && (model.pathLayer || !model.parts.length)) {
+    const path = curvesToPath(model.curves, print.maxBridge);
     if (!path) throw new MsgError(msg('e.noPrintable'));
-    return pathPart(path, '3DM', msg('n.importedCurves', { n: model.curves.length, p: path.xyz.length / 3 }));
+    const info = { n: model.curves.length, p: path.xyz.length / 3, layer: model.pathLayer ?? '' };
+    return { ...pathPart(path, '3DM', msg(model.pathLayer ? 'n.importedCurvesLayer' : 'n.importedCurves', info)), curves: model.curves };
   }
   const { parts: pieces, note } = pickPieces(model, cellRegion());
   const notes: Msg[] = [];
@@ -1323,6 +1327,7 @@ function assembly(): { mesh: MeshData; matrix: Mat3; robot: RobotSettings; name:
   // The beads of an imported path follow the bead settings.
   for (const p of parts)
     if (p.path && p.beads !== beadsKey()) {
+      if (p.curves) p.path = curvesToPath(p.curves, print.maxBridge) ?? p.path;
       p.original = pathProxy(p.path, print);
       p.mesh = p.scale === 1 ? p.original : scale(p.original, p.scale);
       p.beads = beadsKey();
