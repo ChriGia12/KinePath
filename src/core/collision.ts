@@ -82,10 +82,18 @@ const VOXEL = 4; // mm
 const vkey = (ix: number, iy: number, iz: number) => (ix + 2048) * 16777216 + (iy + 2048) * 4096 + (iz + 2048);
 
 /** Obstacles in BASE: the work plate and the printed material (voxels). */
+/** Body points are checked in groups of this many: a group too far to touch anything is skipped. */
+const GROUP = 24;
+
 export class Obstacles {
   private voxels = new Set<number>();
   private readonly bed: [number, number, number, number];
   private readonly root: { p: V3; R: number[] };
+  /** Per body: for every group of GROUP consecutive points, the centre (link frame) and radius of a ball holding them. */
+  private readonly groups: Float64Array[];
+  /** Box of the voxels filled so far (voxel indices; empty while lo > hi). */
+  private lo: [number, number, number] = [Infinity, Infinity, Infinity];
+  private hi: [number, number, number] = [-Infinity, -Infinity, -Infinity];
 
   constructor(
     private readonly r: RobotSettings,
@@ -93,6 +101,25 @@ export class Obstacles {
   ) {
     this.bed = [r.bedCenterX - r.bedSizeX / 2, r.bedCenterY - r.bedSizeY / 2, r.bedCenterX + r.bedSizeX / 2, r.bedCenterY + r.bedSizeY / 2];
     this.root = robotRootFrame(r);
+    this.groups = bodies.map((b) => {
+      const n = b.pts.length / 3;
+      const g = new Float64Array(Math.ceil(n / GROUP) * 4);
+      for (let k = 0; k * GROUP < n; k++) {
+        const [from, to] = [k * GROUP, Math.min(n, (k + 1) * GROUP)];
+        let [cx, cy, cz] = [0, 0, 0];
+        for (let i = from; i < to; i++) {
+          cx += b.pts[i * 3];
+          cy += b.pts[i * 3 + 1];
+          cz += b.pts[i * 3 + 2];
+        }
+        [cx, cy, cz] = [cx / (to - from), cy / (to - from), cz / (to - from)];
+        let rad = 0;
+        for (let i = from; i < to; i++) rad = Math.max(rad, Math.hypot(b.pts[i * 3] - cx, b.pts[i * 3 + 1] - cy, b.pts[i * 3 + 2] - cz));
+        // A little larger than needed: the skip must never leave out a point that could touch.
+        g.set([cx, cy, cz, rad + 0.01], k * 4);
+      }
+      return g;
+    });
   }
 
   /** Material of one bead along a→b (BASE): nozzle `firstLayerZ` above the bead bottom. */
@@ -108,6 +135,9 @@ export class Obstacles {
       for (let ix = Math.floor((x - hw) / VOXEL); ix <= Math.floor((x + hw) / VOXEL); ix++)
         for (let iy = Math.floor((y - hw) / VOXEL); iy <= Math.floor((y + hw) / VOXEL); iy++)
           for (let iz = z0; iz <= z1; iz++) this.voxels.add(vkey(ix, iy, iz));
+      const [i0, i1, j0, j1] = [Math.floor((x - hw) / VOXEL), Math.floor((x + hw) / VOXEL), Math.floor((y - hw) / VOXEL), Math.floor((y + hw) / VOXEL)];
+      this.lo = [Math.min(this.lo[0], i0), Math.min(this.lo[1], j0), Math.min(this.lo[2], z0)];
+      this.hi = [Math.max(this.hi[0], i1), Math.max(this.hi[1], j1), Math.max(this.hi[2], z1)];
     }
   }
 
@@ -117,10 +147,34 @@ export class Obstacles {
     const { p: o, R } = this.root;
     const top = this.r.bedTopZ - 1; // 1 mm tolerance on the plate
     const [bx0, by0, bx1, by1] = this.bed;
-    for (const b of this.bodies) {
+    // Box of the filled voxels in mm (a point is in a filled voxel only inside it).
+    const [vx0, vy0, vz0] = [this.lo[0] * VOXEL, this.lo[1] * VOXEL, this.lo[2] * VOXEL];
+    const [vx1, vy1, vz1] = [(this.hi[0] + 1) * VOXEL, (this.hi[1] + 1) * VOXEL, (this.hi[2] + 1) * VOXEL];
+    for (let bi = 0; bi < this.bodies.length; bi++) {
+      const b = this.bodies[bi];
       const m = T[b.link];
       const pts = b.pts;
+      const g = this.groups[bi];
+      const material = part && !b.needle;
       for (let i = 0; i < pts.length; i += 3) {
+        if (i % (GROUP * 3) === 0) {
+          // A whole group at once: if the ball holding its points is clear of the plate and of
+          // the box of the printed material, none of them can touch — skip to the next group.
+          const k = (i / (GROUP * 3)) * 4;
+          const gx0 = m[0] * g[k] + m[1] * g[k + 1] + m[2] * g[k + 2] + m[3];
+          const gy0 = m[4] * g[k] + m[5] * g[k + 1] + m[6] * g[k + 2] + m[7];
+          const gz0 = m[8] * g[k] + m[9] * g[k + 1] + m[10] * g[k + 2] + m[11];
+          const gx = R[0] * gx0 + R[1] * gy0 + R[2] * gz0 + o[0];
+          const gy = R[3] * gx0 + R[4] * gy0 + R[5] * gz0 + o[1];
+          const gz = R[6] * gx0 + R[7] * gy0 + R[8] * gz0 + o[2];
+          const rad = g[k + 3];
+          const offPlate = gz - rad >= top || gx + rad <= bx0 || gx - rad >= bx1 || gy + rad <= by0 || gy - rad >= by1;
+          const offMaterial = !material || gz - rad >= vz1 || gz + rad < vz0 || gx - rad >= vx1 || gx + rad < vx0 || gy - rad >= vy1 || gy + rad < vy0;
+          if (offPlate && offMaterial) {
+            i += (GROUP - 1) * 3;
+            continue;
+          }
+        }
         const x0 = m[0] * pts[i] + m[1] * pts[i + 1] + m[2] * pts[i + 2] + m[3];
         const y0 = m[4] * pts[i] + m[5] * pts[i + 1] + m[6] * pts[i + 2] + m[7];
         const z0 = m[8] * pts[i] + m[9] * pts[i + 1] + m[10] * pts[i + 2] + m[11];

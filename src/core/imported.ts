@@ -224,6 +224,7 @@ export function moveSeam(pts: PathPoint[], target: [number, number]): { points: 
 }
 
 type V3 = [number, number, number];
+const EMPTY: number[] = [];
 
 /**
  * Tool leaning along the wall, found from the path itself: under every point lies the layer
@@ -237,7 +238,9 @@ export function tiltFromPath(tp: Toolpath, s: Pick<PrintSettings, 'maxTilt' | 'l
   if (pts.length < 2 || s.maxTilt <= 0) return 0;
   // Samples every ~2 mm of the printed path, in buckets.
   const cell = 8;
-  const grid = new Map<string, number[]>();
+  const grid = new Map<number, number[]>();
+  // Bucket of a cell as one number (cells are within ±2000 of the origin: ±16 m).
+  const bucket = (i: number, j: number, k: number) => ((i + 2048) * 4096 + (j + 2048)) * 4096 + (k + 2048);
   const sx: number[] = [];
   const sy: number[] = [];
   const sz: number[] = [];
@@ -247,7 +250,7 @@ export function tiltFromPath(tp: Toolpath, s: Pick<PrintSettings, 'maxTilt' | 'l
     const n = Math.max(1, Math.ceil(Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z) / 2));
     for (let k = 0; k <= n; k++) {
       const [x, y, z] = [a.x + ((b.x - a.x) * k) / n, a.y + ((b.y - a.y) * k) / n, a.z + ((b.z - a.z) * k) / n];
-      const key = `${Math.floor(x / cell)},${Math.floor(y / cell)},${Math.floor(z / cell)}`;
+      const key = bucket(Math.floor(x / cell), Math.floor(y / cell), Math.floor(z / cell));
       if (!grid.has(key)) grid.set(key, []);
       grid.get(key)!.push(sx.length);
       sx.push(x);
@@ -261,12 +264,14 @@ export function tiltFromPath(tp: Toolpath, s: Pick<PrintSettings, 'maxTilt' | 'l
   let leaning = 0;
   const dirs = pts.map((p): V3 => {
     let below = { d: Infinity, k: -1 };
-    const r = Math.ceil(reach / cell);
-    const [ci, cj, ck] = [Math.floor(p.x / cell), Math.floor(p.y / cell), Math.floor(p.z / cell)];
-    for (let i = ci - r; i <= ci + r; i++)
-      for (let j = cj - r; j <= cj + r; j++)
-        for (let k = ck - r; k <= ck + r; k++)
-          for (const q of grid.get(`${i},${j},${k}`) ?? []) {
+    // Only the cells that can hold a sample within reach and at least `gap` lower.
+    const [i0, i1] = [Math.floor((p.x - reach) / cell), Math.floor((p.x + reach) / cell)];
+    const [j0, j1] = [Math.floor((p.y - reach) / cell), Math.floor((p.y + reach) / cell)];
+    const [k0, k1] = [Math.floor((p.z - reach) / cell), Math.floor((p.z - gap) / cell)];
+    for (let i = i0; i <= i1; i++)
+      for (let j = j0; j <= j1; j++)
+        for (let k = k0; k <= k1; k++)
+          for (const q of grid.get(bucket(i, j, k)) ?? EMPTY) {
             const dz = p.z - sz[q];
             if (dz < gap) continue;
             const d = Math.hypot(p.x - sx[q], p.y - sy[q], dz);
