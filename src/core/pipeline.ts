@@ -12,7 +12,7 @@ import { tiltAlongWalls } from './tilt';
 import { evaluateOrientation, OVERHANG_LIMIT, supportOk } from './orientation';
 import { collisionReport, type Body, type CollisionReport } from './collision';
 import { applyEdits, pathSignature, type PathEdits } from './edits';
-import { importedToolpath, type ImportedPath } from './imported';
+import { importedToolpath, moveSeam, tiltFromPath, type ImportedPath } from './imported';
 import { resolveStrategy } from './strategy';
 
 export interface BuildResult {
@@ -102,7 +102,7 @@ export function runBuild(
     const b = computeBounds(turned);
     const [cx, cy] = [(b.min[0] + b.max[0]) / 2, (b.min[1] + b.max[1]) / 2];
     const n = path.xyz.length / 3;
-    const pts: PathPoint[] = [];
+    let pts: PathPoint[] = [];
     let low = Infinity;
     for (let i = 0; i < n; i++) {
       const [x, y, z] = [path.xyz[i * 3], path.xyz[i * 3 + 1], path.xyz[i * 3 + 2]];
@@ -112,7 +112,14 @@ export function runBuild(
     }
     const dz = robot.placement === 'file' && !multi ? -b.min[2] : print.firstLayerZ - low;
     for (const q of pts) q.z += dz;
-    return importedToolpath(pts, print, path.hasExtruder);
+    // A start point chosen by hand: every closed loop of the path starts nearest to it.
+    const seam = start ? moveSeam(pts, start) : null;
+    if (seam) pts = seam.points;
+    const tp = importedToolpath(pts, print, path.hasExtruder);
+    if (seam) tp.warnings.push(msg(seam.moved ? 'i.seamMoved' : 'i.seamNone', { n: seam.moved, open: seam.open }));
+    // Tool leaning along the wall: the wall is read from the path, layer over layer.
+    if (print.toolTilt) tp.warnings.push(msg('i.tiltFromPath', { n: tiltFromPath(tp, print) }));
+    return tp;
   };
   const given = paths?.map((p) => (p ? place(p) : null));
   // What is left to check as a solid (overhangs, risk zones): the parts that are not a path.

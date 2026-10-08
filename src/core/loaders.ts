@@ -26,6 +26,8 @@ export interface LoadedModel {
   format: string;
   parts: ModelPart[];
   notes: Msg[];
+  /** Curves of the file as polylines (x, y, z triples, mm), in the order of the file. */
+  curves?: Float32Array[];
 }
 
 function fromGeometry(g: BufferGeometry): MeshData {
@@ -86,6 +88,41 @@ function rhinoMeshToData(m: Any): MeshData | null {
   return { positions, indices };
 }
 
+/**
+ * A curve as a polyline: its own points when it is one, otherwise sampled finely enough to stay
+ * within 0.05 mm of the curve.
+ */
+function curvePoints(g: Any): Float32Array | null {
+  const out: number[] = [];
+  if (g.isPolyline?.() && g.pointCount) {
+    for (let i = 0; i < g.pointCount; i++) out.push(...(g.point(i) as number[]));
+  } else {
+    const dom = g.domain as [number, number] | undefined;
+    if (!dom || !(dom[1] > dom[0]) || !g.pointAt) return null;
+    const at = (t: number) => g.pointAt(t) as [number, number, number];
+    const split = (t0: number, p0: number[], t1: number, p1: number[], depth: number) => {
+      const tm = (t0 + t1) / 2;
+      const pm = at(tm);
+      const chord = Math.hypot(p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]);
+      const off = Math.hypot(pm[0] - (p0[0] + p1[0]) / 2, pm[1] - (p0[1] + p1[1]) / 2, pm[2] - (p0[2] + p1[2]) / 2);
+      if (depth < 14 && (off > 0.05 || (depth < 3 && chord > 1e-9))) {
+        split(t0, p0, tm, pm, depth + 1);
+        split(tm, pm, t1, p1, depth + 1);
+      } else out.push(...p1);
+    };
+    const spans = Math.max(1, (g.spanCount as number) || 1) * 2;
+    let p0 = at(dom[0]);
+    out.push(...p0);
+    for (let k = 1; k <= spans; k++) {
+      const [t0, t1] = [dom[0] + ((dom[1] - dom[0]) * (k - 1)) / spans, dom[0] + ((dom[1] - dom[0]) * k) / spans];
+      const p1 = at(t1);
+      split(t0, p0, t1, p1, 0);
+      p0 = p1;
+    }
+  }
+  return out.length >= 6 && out.every(Number.isFinite) ? Float32Array.from(out) : null;
+}
+
 export function parse3dm(rhino: Any, bytes: Uint8Array): LoadedModel {
   const doc = rhino.File3dm.fromByteArray(bytes);
   if (!doc) throw new MsgError(msg('e.3dm'));
@@ -102,6 +139,7 @@ export function parse3dm(rhino: Any, bytes: Uint8Array): LoadedModel {
   }
 
   const parts: ModelPart[] = [];
+  const curves: Float32Array[] = [];
   let skipped = 0;
   let blocks = 0;
   let brepsNoMesh = 0;
@@ -134,6 +172,11 @@ export function parse3dm(rhino: Any, bytes: Uint8Array): LoadedModel {
       typeName = 'type.subd';
       const d = rhinoMeshToData(rhino.Mesh.createFromSubDControlNet?.(g));
       if (d) meshes.push(d);
+    } else if (type === rhino.ObjectType.Curve) {
+      const c = curvePoints(g);
+      if (c) curves.push(unitScale === 1 ? c : c.map((v) => v * unitScale));
+      else skipped++;
+      continue;
     } else if (type === rhino.ObjectType.InstanceReference) {
       blocks++;
       continue;
@@ -159,8 +202,10 @@ export function parse3dm(rhino: Any, bytes: Uint8Array): LoadedModel {
   if (blocks) notes.push(msg('n.blocks', { n: blocks }));
   if (skipped) notes.push(msg('n.skipped', { n: skipped }));
   if (unitScale !== 1) notes.push(msg('n.units', { s: unitScale }));
-  if (!parts.length) throw new MsgError(msg('e.3dmEmpty'));
-  return { format: '3DM', parts, notes };
+  // A file of curves only is a path made by hand (imported.ts); with solids too, the solids are the part.
+  if (!parts.length && !curves.length) throw new MsgError(msg('e.3dmEmpty'));
+  if (parts.length && curves.length) notes.push(msg('n.curvesIgnored', { n: curves.length }));
+  return { format: '3DM', parts, notes, curves };
 }
 
 // ---------- STEP / IGES / BREP ----------

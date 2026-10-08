@@ -390,3 +390,48 @@ test('a path made elsewhere (.src from Grasshopper) is placed, checked and writt
   expect(r.pts[0]).toEqual([1418 - 1448, -520 + 1000, 43.5 - 5]);
 });
 
+test('an imported path can be changed: start point, tool leaning; curves of a Rhino file are a path too', async ({ page }) => {
+  // a cone drawn as curves in a Rhino file: closed rings, each 2 mm narrower and 1.5 mm higher
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const rhino = (await ((await import('rhino3dm')).default as any)()) as any;
+  const doc = new rhino.File3dm();
+  for (let k = 0; k < 8; k++) {
+    const pl = new rhino.Polyline();
+    for (let i = 0; i <= 48; i++) pl.add((60 - 2 * k) * Math.cos((i / 48) * 2 * Math.PI), (60 - 2 * k) * Math.sin((i / 48) * 2 * Math.PI), 1 + 1.5 * k);
+    doc.objects().addCurve(pl.toPolylineCurve(), null);
+  }
+  await page.setInputFiles('#file', { name: 'cono.3dm', mimeType: 'application/octet-stream', buffer: Buffer.from(doc.toByteArray()) });
+  await expect(download(page)).toBeEnabled({ timeout: 30_000 });
+  await expect(page.locator('#modelNotes')).toContainText('8 curve del file Rhino');
+  await expect(stat(page, 'Modo scelto')).toContainText('Percorso importato');
+  const first = async () => {
+    const [dl] = await Promise.all([page.waitForEvent('download'), download(page).click()]);
+    const src = readFileSync((await dl.path())!, 'utf8');
+    const l = src.split('\r\n').filter((x) => x.startsWith('LIN {'));
+    return { x: parseFloat(/X (-?[\d.]+)/.exec(l[0])![1]), y: parseFloat(/Y (-?[\d.]+)/.exec(l[0])![1]), cs: l.map((x) => parseFloat(/ C (-?[\d.]+)/.exec(x)![1])) };
+  };
+  // as drawn: every ring starts on +X of the centre (X 5, Y 515), tool vertical
+  let r = await first();
+  expect([r.x, r.y]).toEqual([65, 515]);
+  expect(r.cs.every((c) => c === 180)).toBe(true);
+  // start point moved to the +Y side: every ring starts there
+  await field(page, 'Punto iniziale').selectOption('point');
+  await setField(page, 'Inizio X in BASE', '5');
+  await setField(page, 'Inizio Y in BASE', '600');
+  await expect(page.locator('#warnings')).toContainText('8 giri chiusi del percorso ora partono dal punto scelto');
+  r = await first();
+  expect(r.x).toBeCloseTo(5, 1);
+  expect(r.y).toBeCloseTo(575, 1);
+  // tool leaning along the wall, read from the path (at 30° the nozzle would touch the plate on
+  // the second layer, and the site would block the export: 20° clears it)
+  await setField(page, 'Inclinazione massima', '20');
+  await page.locator('#printFields label').filter({ hasText: 'Inclina l\'utensile lungo la parete' }).locator('input').check();
+  await expect(page.locator('#warnings')).toContainText('la parete è ricavata dal percorso');
+  // a cone leans along X too, where C cannot follow: the site asks to confirm, as for any path
+  await expect(download(page)).toBeDisabled();
+  await page.locator('#tiltOk').check();
+  await expect(download(page)).toBeEnabled();
+  r = await first();
+  expect(Math.max(...r.cs.map((c) => Math.abs(c - 180)))).toBeGreaterThan(10);
+});
+

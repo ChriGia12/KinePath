@@ -4,6 +4,7 @@
 import { msg } from '../i18n';
 import type { MeshData } from './mesh';
 import type { PrintSettings } from './settings';
+import { assignTilt } from './tilt';
 import type { PathPoint, Toolpath } from './toolpath';
 
 export interface ImportedPath {
@@ -113,4 +114,198 @@ export function importedToolpath(points: PathPoint[], s: PrintSettings, hasExtru
   tp.layerCount = tp.layerStart.length;
   tp.warnings.push(msg(hasExtruder ? 'i.imported' : 'i.importedAllOn', { n: points.length }));
   return tp;
+}
+
+/** A stretch of an imported path: a loop that closes on itself, or an open run. */
+export interface Unit {
+  /** Points `from`…`to` of the path, inclusive. */
+  from: number;
+  to: number;
+  closed: boolean;
+}
+
+/** Two points this close are the same point of a loop (mm). */
+const CLOSE = 0.5;
+
+/**
+ * The path read as stretches. A stretch ends where the extruder stops, where a flat layer steps
+ * up to the next one, or where the path comes back onto the point the stretch started from: then
+ * it is a closed loop. A loop written without its last side — from its last corner the path goes
+ * straight to the start of the next layer, right above its own start — is closed too: that side
+ * is printed, as the climb to the next layer.
+ */
+export function pathUnits(pts: PathPoint[]): Unit[] {
+  const units: Unit[] = [];
+  const n = pts.length;
+  const d3 = (a: PathPoint, b: PathPoint) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+  const above = (a: PathPoint, b: PathPoint) => Math.hypot(a.x - b.x, a.y - b.y) <= 2 * CLOSE;
+  let s = 0;
+  let len = 0;
+  let flat = true;
+  let implied = false; // the last stretch ended was a loop without its last side
+  const end = (to: number, closed: boolean) => {
+    if (to > s) units.push({ from: s, to, closed });
+  };
+  for (let i = 1; i < n; i++) {
+    if (i === s) continue; // the move reaching a new stretch belongs to no stretch
+    const dz = Math.abs(pts[i].z - pts[i - 1].z);
+    const step = flat && dz > 0.3 && i - 1 > s;
+    if (!pts[i].e || step) {
+      // Stepping up onto the point above this stretch's start: a loop missing its last side.
+      implied = step && pts[i].e && len > 10 * CLOSE && i - 1 - s >= 2 && above(pts[i], pts[s]);
+      end(i - 1, implied);
+      [s, len, flat] = [i, 0, true];
+      continue;
+    }
+    len += d3(pts[i], pts[i - 1]);
+    if (dz > 0.05) flat = false;
+    if (len > 10 * CLOSE && d3(pts[i], pts[s]) < CLOSE) {
+      end(i, true);
+      [s, len, flat, implied] = [i + 1, 0, true, false];
+    }
+  }
+  // The last stretch has no layer above to tell: it is a loop like the one before it, if that was one.
+  const prev = units[units.length - 1];
+  if (s < n - 1) end(n - 1, implied && !!prev && n - 1 - s >= 2 && above(pts[s], pts[prev.from]));
+  return units;
+}
+
+/**
+ * The same path with every closed loop started from its point nearest to `target` (x, y in the
+ * frame of the points). Open stretches are left as they are: an open line starts where it starts.
+ * Returns the points and how many loops were moved, and how many stretches could not be.
+ */
+export function moveSeam(pts: PathPoint[], target: [number, number]): { points: PathPoint[]; moved: number; open: number } {
+  const units = pathUnits(pts);
+  const out: PathPoint[] = [];
+  let at = 0;
+  let moved = 0;
+  let open = 0;
+  for (const u of units) {
+    for (; at < u.from; at++) out.push(pts[at]);
+    at = u.to + 1;
+    if (!u.closed) {
+      open++;
+      for (let i = u.from; i <= u.to; i++) out.push(pts[i]);
+      continue;
+    }
+    // The loop without its repeated closing point.
+    const dup = Math.hypot(pts[u.to].x - pts[u.from].x, pts[u.to].y - pts[u.from].y, pts[u.to].z - pts[u.from].z) < CLOSE;
+    const loop = pts.slice(u.from, dup ? u.to : u.to + 1);
+    // Nearest point of the loop to the target: on a side, not only at a corner.
+    let best = { d: Infinity, i: 0, t: 0 };
+    for (let i = 0; i < loop.length; i++) {
+      const [a, b] = [loop[i], loop[(i + 1) % loop.length]];
+      const [dx, dy] = [b.x - a.x, b.y - a.y];
+      const l2 = dx * dx + dy * dy;
+      const t = l2 ? Math.max(0, Math.min(1, ((target[0] - a.x) * dx + (target[1] - a.y) * dy) / l2)) : 0;
+      const d = Math.hypot(a.x + t * dx - target[0], a.y + t * dy - target[1]);
+      if (d < best.d) best = { d, i, t };
+    }
+    const [a, b] = [loop[best.i], loop[(best.i + 1) % loop.length]];
+    const on = (t: number): PathPoint => ({ ...a, x: a.x + t * (b.x - a.x), y: a.y + t * (b.y - a.y), z: a.z + t * (b.z - a.z), e: true });
+    // Start on a corner when the nearest point is (almost) one, otherwise on the side itself.
+    const side = Math.hypot(b.x - a.x, b.y - a.y);
+    const start = best.t * side < CLOSE ? best.i : (1 - best.t) * side < CLOSE ? (best.i + 1) % loop.length : -1;
+    const ring: PathPoint[] = [];
+    if (start >= 0) for (let k = 0; k <= loop.length; k++) ring.push({ ...loop[(start + k) % loop.length], e: true });
+    else {
+      ring.push(on(best.t));
+      for (let k = 1; k <= loop.length; k++) ring.push({ ...loop[(best.i + k) % loop.length], e: true });
+      ring.push(on(best.t));
+    }
+    // The move reaching the loop prints or not as the move reaching it did in the file.
+    ring[0].e = pts[u.from].e;
+    if (start !== 0) moved++;
+    for (const q of ring) out.push(q);
+  }
+  for (; at < pts.length; at++) out.push(pts[at]);
+  return { points: out, moved, open };
+}
+
+type V3 = [number, number, number];
+
+/**
+ * Tool leaning along the wall, found from the path itself: under every point lies the layer
+ * printed below it, and the direction from the nearest point of that layer up to this one is the
+ * wall. The tool axis follows it, up to `maxTilt` from the vertical. Where nothing lies below (the
+ * first layer, laid on the plate) the tool stays vertical, and a "wall" flatter than 60° from the
+ * vertical is not one (see below). Returns how many points got a lean.
+ */
+export function tiltFromPath(tp: Toolpath, s: Pick<PrintSettings, 'maxTilt' | 'layerHeight' | 'wallSpacing'>): number {
+  const pts = tp.points;
+  if (pts.length < 2 || s.maxTilt <= 0) return 0;
+  // Samples every ~2 mm of the printed path, in buckets.
+  const cell = 8;
+  const grid = new Map<string, number[]>();
+  const sx: number[] = [];
+  const sy: number[] = [];
+  const sz: number[] = [];
+  for (let i = 1; i < pts.length; i++) {
+    if (!pts[i].e) continue;
+    const [a, b] = [pts[i - 1], pts[i]];
+    const n = Math.max(1, Math.ceil(Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z) / 2));
+    for (let k = 0; k <= n; k++) {
+      const [x, y, z] = [a.x + ((b.x - a.x) * k) / n, a.y + ((b.y - a.y) * k) / n, a.z + ((b.z - a.z) * k) / n];
+      const key = `${Math.floor(x / cell)},${Math.floor(y / cell)},${Math.floor(z / cell)}`;
+      if (!grid.has(key)) grid.set(key, []);
+      grid.get(key)!.push(sx.length);
+      sx.push(x);
+      sy.push(y);
+      sz.push(z);
+    }
+  }
+  const reach = Math.max(8, 4 * s.layerHeight, 1.5 * s.wallSpacing);
+  const gap = 0.4; // a sample this much lower is another layer, not this one
+  const maxTilt = (s.maxTilt * Math.PI) / 180;
+  let leaning = 0;
+  const dirs = pts.map((p): V3 => {
+    let below = { d: Infinity, k: -1 };
+    const r = Math.ceil(reach / cell);
+    const [ci, cj, ck] = [Math.floor(p.x / cell), Math.floor(p.y / cell), Math.floor(p.z / cell)];
+    for (let i = ci - r; i <= ci + r; i++)
+      for (let j = cj - r; j <= cj + r; j++)
+        for (let k = ck - r; k <= ck + r; k++)
+          for (const q of grid.get(`${i},${j},${k}`) ?? []) {
+            const dz = p.z - sz[q];
+            if (dz < gap) continue;
+            const d = Math.hypot(p.x - sx[q], p.y - sy[q], dz);
+            if (d < below.d && d <= reach) below = { d, k: q };
+          }
+    // Nothing below (the first layer, laid on the plate): no wall to lean against, tool vertical.
+    if (below.k < 0) return [0, 0, 1];
+    const [vx, vy, vz] = [p.x - sx[below.k], p.y - sy[below.k], p.z - sz[below.k]];
+    const h = Math.hypot(vx, vy);
+    if (h < 1e-6 || vz <= 0) return [0, 0, 1];
+    // Flatter than 60° from the vertical it is no wall: the pass beside this one on a slope (a
+    // surface printed in one layer), not a layer below. The tool stays vertical there.
+    const raw = Math.atan2(h, vz);
+    if (raw > Math.PI / 3) return [0, 0, 1];
+    const lean = Math.min(raw, maxTilt);
+    if (lean > 0.02) leaning++;
+    return [(vx / h) * Math.sin(lean), (vy / h) * Math.sin(lean), Math.cos(lean)];
+  });
+  assignTilt(tp, dirs);
+  return leaning;
+}
+
+/**
+ * Curves (polylines as x, y, z triples) as a path: each curve is printed, in the order given; the
+ * move from the end of one to the start of the next is made with the extruder off, unless the
+ * next curve starts right where the previous one ended.
+ */
+export function curvesToPath(curves: ArrayLike<number>[]): ImportedPath | null {
+  const xyz: number[] = [];
+  const ext: number[] = [];
+  for (const c of curves) {
+    for (let i = 0; i + 2 < c.length; i += 3) {
+      const n = xyz.length;
+      const same = n > 0 && Math.hypot(xyz[n - 3] - c[i], xyz[n - 2] - c[i + 1], xyz[n - 1] - c[i + 2]) < 1e-3;
+      if (same) continue;
+      xyz.push(c[i], c[i + 1], c[i + 2]);
+      ext.push(i === 0 ? 0 : 1);
+    }
+  }
+  if (xyz.length < 6) return null;
+  return { xyz: Float32Array.from(xyz), ext: Uint8Array.from(ext), hasExtruder: true };
 }

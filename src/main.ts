@@ -16,7 +16,7 @@ import { Viewer } from './viewer';
 import { applyStatic, getLang, locale, msg, MsgError, setLang, t, tm, type Msg } from './i18n';
 import type { WorkerRequest } from './worker';
 import type { PathEdit, PathEdits } from './core/edits';
-import { parseSrc, pathProxy, type ImportedPath } from './core/imported';
+import { curvesToPath, parseSrc, pathProxy, type ImportedPath } from './core/imported';
 
 // ---------- state ----------
 
@@ -252,15 +252,12 @@ const asMade = (): OrientationCandidate => ({
 
 /** Reads a file into a part (not analysed yet); throws with a translatable message. */
 async function readPart(name: string, bytes: ArrayBuffer): Promise<Part> {
-  // A KRL program: its LIN points are the path, taken as it is.
-  if (/\.(src|krl|txt)$/i.test(name)) {
-    const path = parseSrc(new TextDecoder().decode(bytes));
-    if (!path) throw new MsgError(msg('e.srcNoLin'));
+  const pathPart = (path: ImportedPath, format: string, note: Msg): Part => {
     const original = pathProxy(path, print);
     return {
       name,
-      format: 'KRL',
-      notes: [msg(path.hasExtruder ? 'n.importedPath' : 'n.importedPathAllOn', { n: path.xyz.length / 3 })],
+      format,
+      notes: [note],
       file: { name, bytes },
       original,
       scale: 1,
@@ -275,8 +272,20 @@ async function readPart(name: string, bytes: ArrayBuffer): Promise<Part> {
       path,
       beads: beadsKey(),
     };
+  };
+  // A KRL program: its LIN points are the path.
+  if (/\.(src|krl|txt)$/i.test(name)) {
+    const path = parseSrc(new TextDecoder().decode(bytes));
+    if (!path) throw new MsgError(msg('e.srcNoLin'));
+    return pathPart(path, 'KRL', msg(path.hasExtruder ? 'n.importedPath' : 'n.importedPathAllOn', { n: path.xyz.length / 3 }));
   }
   const model = await busy(t('busy.read', { name }), () => loadModel(new File([bytes], name)));
+  // A Rhino file of curves only: the curves are the path, one after the other.
+  if (!model.parts.length && model.curves?.length) {
+    const path = curvesToPath(model.curves);
+    if (!path) throw new MsgError(msg('e.noPrintable'));
+    return pathPart(path, '3DM', msg('n.importedCurves', { n: model.curves.length, p: path.xyz.length / 3 }));
+  }
   const { parts: pieces, note } = pickPieces(model, cellRegion());
   const notes: Msg[] = [];
   if (note) notes.push(note);

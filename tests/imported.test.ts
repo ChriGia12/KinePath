@@ -3,7 +3,10 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { cellBodies, type CellPart } from '../src/core/collision';
-import { parseSrc, pathProxy } from '../src/core/imported';
+import rhino3dm from 'rhino3dm';
+import { curvesToPath, moveSeam, parseSrc, pathProxy, pathUnits, tiltFromPath, importedToolpath } from '../src/core/imported';
+import { parse3dm } from '../src/core/loaders';
+import type { PathPoint } from '../src/core/toolpath';
 import { computeBounds, IDENTITY, type Mat3 } from '../src/core/mesh';
 import { runBuild } from '../src/core/pipeline';
 import { DEFAULT_PRINT, DEFAULT_ROBOT } from '../src/core/settings';
@@ -108,3 +111,120 @@ describe('the program written around an imported path', () => {
     expect(r.src).toContain('RIACCENSIONE ESTRUSORE');
   });
 });
+
+describe('an imported path can be changed, not only copied', () => {
+  /** `layers` square loops 80 mm wide, each closed on its first point, stepping straight up. */
+  const squares = (layers: number, closing = true): PathPoint[] => {
+    const pts: PathPoint[] = [];
+    for (let k = 0; k < layers; k++)
+      for (const [x, y] of [[-40, -40], [40, -40], [40, 40], [-40, 40], ...(closing ? [[-40, -40]] : [])]) pts.push({ x, y, z: 0.5 + k * 1.5, e: pts.length > 0 });
+    return pts;
+  };
+  const printed = (pts: PathPoint[]) => pts.reduce((a, p, i) => (i && p.e ? a + Math.hypot(p.x - pts[i - 1].x, p.y - pts[i - 1].y, p.z - pts[i - 1].z) : a), 0);
+
+  it('its closed loops are recognised, layer after layer', () => {
+    const units = pathUnits(squares(3));
+    expect(units.map((u) => [u.from, u.to, u.closed])).toEqual([[0, 4, true], [5, 9, true], [10, 14, true]]);
+    // loops written without their last side (the path climbs along it to the next layer) still close
+    expect(pathUnits(squares(3, false)).map((u) => u.closed)).toEqual([true, true, true]);
+    // open arcs printed back and forth are not loops
+    const arcs: PathPoint[] = [];
+    for (let k = 0; k < 3; k++) for (const x of k % 2 ? [80, 40, 0] : [0, 40, 80]) arcs.push({ x, y: x === 40 ? 20 : 0, z: 0.5 + k * 1.5, e: arcs.length > 0 });
+    expect(pathUnits(arcs).map((u) => u.closed)).toEqual([false, false, false]);
+    expect(moveSeam(arcs, [40, 30]).points).toEqual(arcs);
+  });
+
+  it('the start point moves: every loop starts from the point nearest to the one chosen', () => {
+    const pts = squares(3);
+    const r = moveSeam(pts, [40, 40]);
+    expect(r.moved).toBe(3);
+    expect(r.open).toBe(0);
+    const units = pathUnits(r.points);
+    for (const u of units) expect([r.points[u.from].x, r.points[u.from].y]).toEqual([40, 40]);
+    // the same loops are printed, whole: same length on every layer
+    expect(printed(r.points)).toBeCloseTo(printed(pts), 6);
+    // on the middle of a side too: the loop is opened there
+    const mid = moveSeam(pts, [0, -45]);
+    const u0 = pathUnits(mid.points)[0];
+    expect([mid.points[u0.from].x, mid.points[u0.from].y]).toEqual([0, -40]);
+    expect(printed(mid.points)).toBeCloseTo(printed(pts), 6);
+  });
+
+  it('a continuous spiral has no loop to restart from: it is left as it is, and that is said', () => {
+    const spiral: PathPoint[] = Array.from({ length: 400 }, (_, i) => ({ x: 40 * Math.cos(i / 20), y: 40 * Math.sin(i / 20), z: 0.5 + i * 0.01, e: i > 0 }));
+    const r = moveSeam(spiral, [0, 40]);
+    expect(r.moved).toBe(0);
+    expect(r.points).toEqual(spiral);
+  });
+
+  it('through the whole build: the program starts where chosen and says so', () => {
+    const path = parseSrc(grasshopper())!;
+    const print = { ...DEFAULT_PRINT, startMode: 'point' as const, startX: 5 + 40, startY: 515 + 40 };
+    const r = runBuild(pathProxy(path, print), I, print, DEFAULT_ROBOT, 'prova.src', bodies, undefined, undefined, [path]);
+    expect(r.toolpath.warnings.map((w) => w.k)).toContain('i.seamMoved');
+    const first = r.toolpath.points[0];
+    expect([first.x + r.offset[0], first.y + r.offset[1]]).toEqual([45, 555]);
+    expect(r.errors).toEqual([]);
+    expect(r.collision?.count).toBe(0);
+  });
+
+  it('the tool can lean along the wall: the wall is read from the path itself', () => {
+    const ring = (r: number, z: number, first: boolean): PathPoint[] => Array.from({ length: 49 }, (_, i) => ({ x: r * Math.cos((i / 48) * 2 * Math.PI), y: r * Math.sin((i / 48) * 2 * Math.PI), z, e: !(first && i === 0) }));
+    // a cone: every layer 2 mm narrower than the one below, 1.5 mm higher → walls lean inwards
+    const cone = importedToolpath(Array.from({ length: 10 }, (_, k) => ring(60 - 2 * k, 0.5 + 1.5 * k, k === 0)).flat(), DEFAULT_PRINT, true);
+    // every layer leans but the first, laid on the plate: nothing below to lean against
+    expect(tiltFromPath(cone, DEFAULT_PRINT)).toBe(cone.points.length - 49);
+    const c = cone.points.map((p) => p.c!);
+    expect(Math.max(...c.map((v) => Math.abs(v - 180)))).toBeGreaterThan(20); // leaning by up to maxTilt (30°)
+    expect(Math.max(...c.map((v) => Math.abs(v - 180)))).toBeLessThan(30.5);
+    // a straight tube: walls are vertical, the tool stays vertical
+    const tube = importedToolpath(Array.from({ length: 10 }, (_, k) => ring(60, 0.5 + 1.5 * k, k === 0)).flat(), DEFAULT_PRINT, true);
+    expect(tiltFromPath(tube, DEFAULT_PRINT)).toBe(0);
+    expect(tube.points.every((p) => Math.abs(p.c! - 180) < 0.5)).toBe(true);
+  });
+});
+
+describe('a path drawn as curves in a Rhino file', async () => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const rhino = (await (rhino3dm as any)()) as any;
+  const polyline = (pts: number[][]) => {
+    const pl = new rhino.Polyline();
+    for (const p of pts) pl.add(p[0], p[1], p[2]);
+    return pl.toPolylineCurve();
+  };
+  const file = (withMesh: boolean) => {
+    const doc = new rhino.File3dm();
+    doc.objects().addCurve(polyline([[0, 0, 1], [50, 0, 1], [50, 50, 1], [0, 50, 1], [0, 0, 1]]), null);
+    doc.objects().addCurve(polyline([[0, 0, 2.5], [50, 0, 2.5], [50, 50, 2.5]]), null);
+    doc.objects().addCurve(new rhino.Circle(20).toNurbsCurve(), null);
+    if (withMesh) {
+      const m = new rhino.Mesh();
+      for (const v of [[0, 0, 0], [10, 0, 0], [0, 10, 0], [0, 0, 10]]) m.vertices().add(v[0], v[1], v[2]);
+      for (const f of [[0, 2, 1], [0, 1, 3], [1, 2, 3], [0, 3, 2]]) m.faces().addTriFace(f[0], f[1], f[2]);
+      doc.objects().addMesh(m, null);
+    }
+    return new Uint8Array(doc.toByteArray());
+  };
+
+  it('curves only: they are the path, in the order of the file', () => {
+    const model = parse3dm(rhino, file(false));
+    expect(model.parts.length).toBe(0);
+    expect(model.curves!.length).toBe(3);
+    expect(model.curves![0].length / 3).toBe(5);
+    // the circle is sampled finely: every point within 0.05 mm of radius 20
+    const circle = model.curves![2];
+    expect(circle.length / 3).toBeGreaterThan(40);
+    for (let i = 0; i < circle.length; i += 3) expect(Math.abs(Math.hypot(circle[i], circle[i + 1]) - 20)).toBeLessThan(0.05);
+    const path = curvesToPath(model.curves!)!;
+    // every curve printed, the move onto a curve with the extruder off
+    const starts = [...path.ext].map((e, i) => (e ? -1 : i)).filter((i) => i >= 0);
+    expect(starts).toEqual([0, 5, 8]);
+  });
+
+  it('with a solid in the file the solid is the part, and the curves are reported', () => {
+    const model = parse3dm(rhino, file(true));
+    expect(model.parts.length).toBe(1);
+    expect(model.notes.map((n) => n.k)).toContain('n.curvesIgnored');
+  });
+});
+

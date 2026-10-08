@@ -134,6 +134,15 @@ export function tiltAlongWalls(tp: Toolpath, mesh: MeshData, s: PrintSettings): 
     const lean = Math.min(Math.atan2(h, v[2]), maxTilt);
     return [(v[0] / h) * Math.sin(lean), (v[1] / h) * Math.sin(lean), Math.cos(lean)];
   });
+  assignTilt(tp, dirs);
+}
+
+/**
+ * Sets the C of every point from the direction the tool axis should have there (unit vectors,
+ * part frame): smoothed along the path so the wrist turns gradually, then turned into C.
+ */
+export function assignTilt(tp: Toolpath, dirs: V3[]): void {
+  const pts = tp.points;
   // Smooth along the path (box filter over ±SMOOTH/2 mm of path length).
   const cum = new Float64Array(pts.length);
   for (let i = 1; i < pts.length; i++) cum[i] = cum[i - 1] + Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y, pts[i].z - pts[i - 1].z);
