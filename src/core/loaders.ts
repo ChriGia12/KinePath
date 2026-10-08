@@ -11,7 +11,7 @@ import { computeBounds, mergeMeshes, orientOutward, weld, type MeshData } from '
 // Served by the site itself (scripts/copy-vendor.mjs): no CDN, no network needed to import.
 const vendor = (file: string) => new URL(`vendor/${file}`, document.baseURI).href;
 
-export const ACCEPTED = '.stl,.obj,.ply,.3dm,.step,.stp,.iges,.igs,.brep';
+export const ACCEPTED = '.stl,.obj,.ply,.3dm,.step,.stp,.iges,.igs,.brep,.src,.txt';
 
 export interface ModelPart {
   id: number;

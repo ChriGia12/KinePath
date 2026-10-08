@@ -354,3 +354,39 @@ test('a stretch of the path can be changed by hand, and undone', async ({ page }
   await expect(page.locator('#warnings')).toContainText('le modifiche fatte a mano non valgono più');
 });
 
+test('a path made elsewhere (.src from Grasshopper) is placed, checked and written as a complete program', async ({ page }) => {
+  // what KUKA|prc writes: world coordinates, its own A/B/C, no extruder, no safe position, no homing
+  const lin = (x: number, y: number, z: number) => `LIN {X ${x}, Y ${y}, Z ${z}, A -167.186, B 0, C 180, E1 1050, E2 0, E3 0, E4 0} C_DIS`;
+  const rows = ['DEF prova ( )', 'PTP $AXIS_ACT ; skip BCO quickly'];
+  for (let k = 0; k < 3; k++) for (const [x, y] of [[-40, -40], [40, -40], [40, 40], [-40, 40], [-40, -40]]) rows.push(lin(1458 + x, -480 + y, 43.5 + k * 1.5));
+  await page.setInputFiles('#file', { name: 'percorso.src', mimeType: 'text/plain', buffer: Buffer.from([...rows, 'END'].join('\r\n')) });
+  await expect(download(page)).toBeEnabled();
+  await expect(stat(page, 'Modo scelto')).toContainText('Percorso importato');
+  await expect(page.locator('#modelNotes')).toContainText('Percorso già pronto: 15 punti LIN');
+  await expect(page.locator('#cutBox')).toBeHidden();
+  await expect(page.locator('#step-orient')).toBeHidden();
+  const lins = async () => {
+    const [dl] = await Promise.all([page.waitForEvent('download'), download(page).click()]);
+    const src = readFileSync((await dl.path())!, 'utf8');
+    return { src, pts: src.split('\r\n').filter((l) => l.startsWith('LIN {')).map((l) => ['X', 'Y', 'Z'].map((a) => parseFloat(new RegExp(`${a} (-?[\\d.]+)`).exec(l)![1]))) };
+  };
+  // centred on the point of the plate (X 5, Y 515), first layer 0.5 mm above the plate at Z 38
+  let r = await lins();
+  expect(r.pts.length).toBe(15);
+  expect(r.pts[0]).toEqual([5 - 40, 515 - 40, 38.5]);
+  expect(r.src).toContain('A -180.000, B 0.000, C 180.000, E1 0.000');
+  expect(r.src).toContain('ACCENSIONE ESTRUSORE');
+  expect(r.src).toContain('; HOMING');
+  // moved: the program is written again with the new coordinates
+  await page.locator('#step-robot summary').click();
+  await setField(page, 'Centro X in BASE', '60');
+  await expect(download(page)).toBeEnabled();
+  r = await lins();
+  expect(r.pts[0]).toEqual([60 - 40, 515 - 40, 38.5]);
+  // kept where the file has it: world → BASE, as the Python script did
+  await field(page, 'Posizione del pezzo').selectOption('file');
+  await expect(download(page)).toBeEnabled();
+  r = await lins();
+  expect(r.pts[0]).toEqual([1418 - 1448, -520 + 1000, 43.5 - 5]);
+});
+

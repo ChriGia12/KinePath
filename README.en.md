@@ -70,6 +70,8 @@ The robot stands in the Rhino world at (0, −1000, 0): the point drawn in `BASE
 
 **Change of part.** With several parts, once a part is finished the site switches the extruder off, goes straight up with a LIN without blending to 30 mm above what is already printed, moves above the next part with a `PTP` and goes down with a LIN where printing resumes (extruder on again). These PTPs go through the collision check as well, with the controller's axis interpolation.
 
+**Ready-made path (from Grasshopper).** For parts whose path is better drawn by hand, load the `.src` (or `.txt`) file written by Grasshopper / KUKA|prc directly, like any part. The site takes the `LIN` points in the order of the file, **as they are**, and does what the Python script used to do, plus the checks: it recomputes the coordinates for the chosen position, sets the tool orientation (A/B/C) and external axes chosen here, and writes the complete program (start, extruder, safe position, homing). Everything else in the file (header, PTPs, speeds, A/B/C) is ignored. If the file has extruder commands (`$OUT[16]`, `$ANOUT[7]`) they are followed; if not, as in raw Grasshopper files, the whole path is printed and the stretches to run with the extruder off are chosen with *Edit path*. The path is moved by dragging it, with *Place part*, with the *Centre X/Y* and *Part rotation Z* fields, and the `.src` is written again at every change: with *Centre on the given point* its lowest point goes *First pass above the table* over the plate; with *Keep file position* the BASE origin (1448 / −1000 / 5) is subtracted from every point, exactly as the script did. All checks (reach, axis limits, points below the plate, collisions) and the simulation apply to the path. The view shows the beads of the path; cut, orientation, supports and strategy choice do not apply, since the path is not computed by the site. There is no need to load the mesh of the part too: it would be printed as a second part.
+
 **Edit path.** If the computed path is not right somewhere, *Edit path* (below the simulation) changes it by hand: give a stretch from its start LIN to its end LIN (*here* takes the LIN shown by the slider) and print it with the extruder off or on, move it by ΔX/ΔY/ΔZ, or delete its points. *Undo last* and *Remove all* go back. Edits are applied to the finished path **before** the checks: reach, axis limits and collisions are run again on the edited path, and the result warns that the printed part may no longer match the mesh. They hold only for the path they were made on: if it changes (a setting, the orientation, the position) they are removed and the site says so. They are not applied with supports in a separate file.
 
 **Projects.** *Save project* downloads a `.kinepath` file with the original files of the parts, their orientation and position and all the settings; *Open project* (or dropping the file on the upload area) brings the site back to exactly that state.
@@ -81,6 +83,7 @@ The robot stands in the Rhino world at (0, −1000, 0): the point drawn in `BASE
 | STL, OBJ, PLY | Three.js loaders (units assumed mm) |
 | 3DM (Rhino) | rhino3dm: meshes, polysurfaces and extrusions (using the render meshes saved in the file), SubD. Units converted to mm |
 | STEP, IGES, BREP | OpenCascade (occt-import-js), 0.1 mm tessellation |
+| SRC, TXT (KRL program) | ready-made path: the `LIN` points of the file, used as they are |
 
 The rhino3dm and OpenCascade libraries are served by the site itself (`public/vendor`, copied from `node_modules` at every build): importing needs no CDN and no network.
 
@@ -154,6 +157,7 @@ src/core/walls.ts        inner walls and shell mid-line (Clipper)
 src/core/lattice.ts      thin-walled networks: mid-lines and single path
 src/core/strategy.ts     automatic choice of how to lay the contour
 src/core/edits.ts        edits made by hand to the path
+src/core/imported.ts     ready-made path: reads the LINs of a .src
 src/core/orientation.ts  orientation analysis
 src/core/toolpath.ts     toolpath: contour layers, spiral, solid, surface
 src/core/zigzag.ts       serpentine fill and pass ordering

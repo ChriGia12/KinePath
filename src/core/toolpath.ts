@@ -35,7 +35,8 @@ export interface PathPoint {
 
 export interface Toolpath {
   points: PathPoint[];
-  mode: PrintMode;
+  /** 'imported': a path made elsewhere and taken as it is (imported.ts). */
+  mode: PrintMode | 'imported';
   layerCount: number;
   layerHeight: number;
   /** index in `points` where each layer starts (for the viewer's layer slider) */

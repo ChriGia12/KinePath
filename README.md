@@ -70,6 +70,8 @@ Il robot sta nel mondo Rhino a (0, −1000, 0): il punto disegnato in `BASE ROBO
 
 **Cambio pezzo.** Con più pezzi, finito un pezzo il sito spegne l'estrusore, sale in verticale con un LIN senza raccordo fino a 30 mm sopra quanto già stampato, si sposta sopra il pezzo successivo con un `PTP` e scende con un LIN dove la stampa riprende (estrusore riacceso). Anche questi PTP passano dal controllo collisioni, con l'interpolazione degli assi del controller.
 
+**Percorso già pronto (da Grasshopper).** Per i pezzi il cui percorso conviene disegnare a mano, si carica direttamente il file `.src` (o `.txt`) scritto da Grasshopper / KUKA|prc, come un pezzo qualsiasi. Il sito prende i punti `LIN` nell'ordine del file, **così come sono**, e fa quello che prima faceva lo script Python, più i controlli: ricalcola le coordinate per la posizione scelta, mette l'orientamento utensile (A/B/C) e gli assi esterni impostati qui, e scrive il programma completo (avvio, estrusore, posizione sicura, homing). Tutto il resto del file (intestazione, PTP, velocità, A/B/C) viene ignorato. Se il file contiene i comandi dell'estrusore (`$OUT[16]`, `$ANOUT[7]`) vengono seguiti; se non ci sono, come nei file grezzi di Grasshopper, tutto il percorso è stampato e i tratti da fare a estrusore spento si scelgono con *Modifica percorso*. Il percorso si sposta trascinandolo, con *Posiziona pezzo*, con i campi *Centro X/Y* e *Rotazione pezzo Z*, e a ogni modifica il `.src` viene riscritto: con *Centra sul punto indicato* il punto più basso va a *Prima passata sopra il piano* dalla lastra; con *Mantieni posizione del file* a ogni punto viene tolta l'origine della BASE (1448 / −1000 / 5), esattamente come faceva lo script. Sul percorso valgono tutti i controlli (portata, limiti degli assi, punti sotto la lastra, collisioni) e la simulazione. Nella vista compaiono i cordoli del percorso; taglio, orientamento, supporti e scelta della strategia non si applicano, perché il percorso non è calcolato dal sito. Non serve caricare anche la mesh del pezzo: verrebbe stampata come un secondo pezzo.
+
 **Modifica percorso.** Se il percorso calcolato non va bene in un punto, *Modifica percorso* (sotto la simulazione) permette di cambiarlo a mano: si indica un tratto dal LIN di inizio a quello di fine (*qui* prende il LIN mostrato dal cursore) e lo si stampa a estrusore spento o acceso, lo si sposta di ΔX/ΔY/ΔZ, oppure se ne tolgono i punti. *Annulla ultima* e *Togli tutte* tornano indietro. Le modifiche sono applicate al percorso finito **prima** dei controlli: portata, limiti degli assi e collisioni vengono rifatti sul percorso modificato, e il risultato avvisa che il pezzo stampato può non corrispondere più alla mesh. Valgono solo per il percorso su cui sono state fatte: se cambia (un'impostazione, l'orientamento, la posizione) vengono tolte e il sito lo dice. Non si applicano con i supporti in un file a parte.
 
 **Progetti.** *Salva progetto* scarica un file `.kinepath` con i file originali dei pezzi, il loro orientamento e la posizione e tutte le impostazioni; *Apri progetto* (o trascinare il file sulla zona di caricamento) riporta il sito esattamente a quello stato.
@@ -81,6 +83,7 @@ Il robot sta nel mondo Rhino a (0, −1000, 0): il punto disegnato in `BASE ROBO
 | STL, OBJ, PLY | loader Three.js (unità assunte in mm) |
 | 3DM (Rhino) | rhino3dm: mesh, polisuperfici ed estrusioni (usa le mesh di render salvate nel file), SubD. Unità convertite in mm |
 | STEP, IGES, BREP | OpenCascade (occt-import-js), tassellazione 0,1 mm |
+| SRC, TXT (programma KRL) | percorso già pronto: i punti `LIN` del file, usati così come sono |
 
 Le librerie rhino3dm e OpenCascade sono servite dal sito stesso (`public/vendor`, copiate da `node_modules` a ogni build): l'importazione non usa CDN né rete.
 
@@ -154,6 +157,7 @@ src/core/walls.ts        pareti interne e linea media dei gusci (Clipper)
 src/core/lattice.ts      reticoli a pareti sottili: linee medie e percorso unico
 src/core/strategy.ts     scelta automatica di come stendere il contorno
 src/core/edits.ts        modifiche a mano al percorso
+src/core/imported.ts     percorso già pronto: lettura dei LIN di un .src
 src/core/orientation.ts  analisi orientamenti
 src/core/toolpath.ts     percorso: contorno a strati, spirale, pieno, superficie
 src/core/zigzag.ts       riempimento a serpentina e ordinamento delle passate

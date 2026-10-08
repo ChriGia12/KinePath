@@ -8,11 +8,12 @@ import type { PrintSettings, RobotSettings } from './core/settings';
 import type { Body } from './core/collision';
 import type { PartBox } from './core/parts';
 import type { PathEdits } from './core/edits';
+import type { ImportedPath } from './core/imported';
 
 export type WorkerRequest =
   | { type: 'ping'; id: number }
   | { type: 'analyze'; id: number; mesh: MeshData; print: PrintSettings; downs?: [number, number, number][] }
-  | { type: 'build'; id: number; mesh: MeshData; matrix: Mat3; print: PrintSettings; robot: RobotSettings; sourceName: string; bodies?: Body[]; partBoxes?: PartBox[]; edits?: PathEdits };
+  | { type: 'build'; id: number; mesh: MeshData; matrix: Mat3; print: PrintSettings; robot: RobotSettings; sourceName: string; bodies?: Body[]; partBoxes?: PartBox[]; edits?: PathEdits; paths?: (ImportedPath | null)[] };
 
 self.onmessage = (ev: MessageEvent<WorkerRequest>) => {
   const req = ev.data;
@@ -26,7 +27,7 @@ self.onmessage = (ev: MessageEvent<WorkerRequest>) => {
       const split = o && !o.valid ? suggestSplit(req.mesh, req.print, { overhang: o.overhangRatio, islands: o.unsupportedIslands }) : null;
       self.postMessage({ type: 'analyze', id: req.id, orientations, split });
     } else {
-      const r = runBuild(req.mesh, req.matrix, req.print, req.robot, req.sourceName, req.bodies, req.partBoxes, req.edits);
+      const r = runBuild(req.mesh, req.matrix, req.print, req.robot, req.sourceName, req.bodies, req.partBoxes, req.edits, req.paths);
       // Flatten the path into typed arrays for a cheap transfer to the viewer.
       const pts = r.toolpath.points;
       const xyz = new Float32Array(pts.length * 3);

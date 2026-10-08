@@ -60,12 +60,19 @@ export function splitByBoxes(mesh: MeshData, boxes: PartBox[], offset: [number, 
  * The toolpath of every part in turn (order of `boxes`), joined by a change of part. `start`:
  * where the first part starts (part frame); each next part starts near where the previous ended.
  */
-export function printPartsInTurn(mesh: MeshData, s: PrintSettings, boxes: PartBox[], offset: [number, number, number], start?: Vec2): Toolpath {
+export function printPartsInTurn(
+  mesh: MeshData,
+  s: PrintSettings,
+  boxes: PartBox[],
+  offset: [number, number, number],
+  start?: Vec2,
+  /** Parts that are a path made elsewhere (imported.ts): its points, used as they are. */
+  given?: (Toolpath | null | undefined)[],
+): Toolpath {
   const all = splitByBoxes(mesh, boxes, offset);
-  const meshes = all.filter((m): m is MeshData => !!m);
   const out: Toolpath = {
     points: [],
-    mode: s.mode,
+    mode: s.mode as Toolpath['mode'],
     layerCount: 0,
     layerHeight: s.layerHeight,
     layerStart: [],
@@ -80,9 +87,10 @@ export function printPartsInTurn(mesh: MeshData, s: PrintSettings, boxes: PartBo
   let topArea = 0;
   let zTop = -Infinity;
   let from: Vec2 | undefined = start;
-  meshes.forEach((m, k) => {
-    const tp = buildToolpath(m, s, undefined, from);
-    if (!tp.points.length) return;
+  let first = true;
+  all.forEach((m, k) => {
+    const tp = given?.[k] ?? (m ? buildToolpath(m, s, undefined, from) : null);
+    if (!tp?.points.length) return;
     if (out.points.length) {
       // Change of part: straight up from the last printed point, PTP above where the next part
       // starts; its first point (a non-extruding move down to the start) follows.
@@ -103,7 +111,8 @@ export function printPartsInTurn(mesh: MeshData, s: PrintSettings, boxes: PartBo
     out.printLength += tp.printLength;
     out.travelLength += tp.travelLength;
     out.travels += tp.travels;
-    if (k === 0) out.mode = tp.mode;
+    if (first) out.mode = tp.mode;
+    first = false;
     if (tp.tiltX) out.tiltX = (out.tiltX ?? 0) + tp.tiltX;
     if (tp.coverage !== undefined && tp.topArea) {
       coveredArea += tp.coverage * tp.topArea;
@@ -122,7 +131,7 @@ export function printPartsInTurn(mesh: MeshData, s: PrintSettings, boxes: PartBo
   });
   // A part with nothing left (e.g. lower than the base cut) must not vanish without a word.
   all.forEach((m, k) => {
-    if (!m) out.warnings.push(msg('w.partEmpty', { i: k + 1 }));
+    if (!m && !given?.[k]) out.warnings.push(msg('w.partEmpty', { i: k + 1 }));
   });
   if (topArea) {
     out.coverage = coveredArea / topArea;

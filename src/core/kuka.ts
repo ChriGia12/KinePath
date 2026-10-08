@@ -143,10 +143,12 @@ PTP ${frame(pts[0], r)}
 LIN ${frame(pts[0], r)}${approx}
 `);
 
-  L.push(...extruderOn(r, 'ACCENSIONE ESTRUSORE'), '', '; =========================', '; INIZIO STAMPA', '; =========================');
+  // The extruder is switched on here unless the path begins with a move that does not print.
+  const startOn = pts.length < 2 || pts[1].e;
+  L.push(...(startOn ? extruderOn(r, 'ACCENSIONE ESTRUSORE') : []), '', '; =========================', '; INIZIO STAMPA', '; =========================');
 
   // Only LIN moves between start and end, exactly like Tavolino1.src (no extra comments).
-  let extruding = true;
+  let extruding = startOn;
   for (let i = 1; i < pts.length; i++) {
     const p = pts[i];
     if (!p.e && extruding) {

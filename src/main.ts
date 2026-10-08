@@ -16,6 +16,7 @@ import { Viewer } from './viewer';
 import { applyStatic, getLang, locale, msg, MsgError, setLang, t, tm, type Msg } from './i18n';
 import type { WorkerRequest } from './worker';
 import type { PathEdit, PathEdits } from './core/edits';
+import { parseSrc, pathProxy, type ImportedPath } from './core/imported';
 
 // ---------- state ----------
 
@@ -105,6 +106,12 @@ interface Part {
   split?: SplitPlan | null;
   /** A piece of a cut part: the file scale and the cuts that made it (scale is then locked). */
   source?: { scale: number; cuts: { n: [number, number, number]; d: number }[] };
+  /**
+   * A path made elsewhere (a .src from Grasshopper): used as it is. `original` / `mesh` are then
+   * its beads, to show and place it like any part; `beads`: the settings they were drawn with.
+   */
+  path?: ImportedPath;
+  beads?: string;
 }
 let parts: Part[] = [];
 let active = -1;
@@ -223,8 +230,52 @@ const cellRegion = (): CellRegion => ({
   bedSize: [robot.bedSizeX, robot.bedSizeY],
 });
 
+/** The settings the beads of an imported path are drawn with. */
+const beadsKey = () => `${print.wallSpacing}|${print.layerHeight}|${print.firstLayerZ}`;
+
+/** An imported path has one way to lie: as it was made. */
+const asMade = (): OrientationCandidate => ({
+  id: 0,
+  label: msg('o.asImported'),
+  down: [0, 0, -1],
+  matrix: [...IDENTITY] as Mat3,
+  height: 0,
+  baseArea: 0,
+  overhangRatio: 0,
+  unsupportedIslands: 0,
+  maxIslands: 1,
+  singleLoop: false,
+  score: 0,
+  valid: true,
+  notes: [],
+});
+
 /** Reads a file into a part (not analysed yet); throws with a translatable message. */
 async function readPart(name: string, bytes: ArrayBuffer): Promise<Part> {
+  // A KRL program: its LIN points are the path, taken as it is.
+  if (/\.(src|krl|txt)$/i.test(name)) {
+    const path = parseSrc(new TextDecoder().decode(bytes));
+    if (!path) throw new MsgError(msg('e.srcNoLin'));
+    const original = pathProxy(path, print);
+    return {
+      name,
+      format: 'KRL',
+      notes: [msg(path.hasExtruder ? 'n.importedPath' : 'n.importedPathAllOn', { n: path.xyz.length / 3 })],
+      file: { name, bytes },
+      original,
+      scale: 1,
+      mesh: original,
+      orientations: [],
+      orientIdx: 0,
+      manual: [...IDENTITY] as Mat3,
+      x: robot.originX,
+      y: robot.originY,
+      rotZ: robot.rotationZ,
+      placed: false,
+      path,
+      beads: beadsKey(),
+    };
+  }
   const model = await busy(t('busy.read', { name }), () => loadModel(new File([bytes], name)));
   const { parts: pieces, note } = pickPieces(model, cellRegion());
   const notes: Msg[] = [];
@@ -289,7 +340,7 @@ function selectPart(i: number) {
   renderRobotFields();
   renderParts();
   renderOrientations();
-  $('step-orient').hidden = !p?.orientations.length;
+  $('step-orient').hidden = !p?.orientations.length || !!p.path;
   if (p) {
     showModelInfo(p);
     setNotes([...p.notes, ...scaleHints(p)]);
@@ -325,7 +376,7 @@ function placedFrame(p: Part) {
 
 function renderSplit() {
   const p = cur();
-  const ready = !!p && p.orientations.length > 0;
+  const ready = !!p && p.orientations.length > 0 && !p.path; // a path made elsewhere is not cut
   $('cutBox').hidden = !ready;
   viewer.setCutPlane(null);
   if (!p || !ready) return;
@@ -686,13 +737,19 @@ function renderParts() {
 
 function showModelInfo(p: Part) {
   const s = meshStats(p.mesh);
-  const rows: [string, string][] = [
+  const rows: [string, string][] = p.path
+    ? [
+        [t('info.format'), t('info.importedPath')],
+        [t('r.points'), (p.path.xyz.length / 3).toLocaleString(locale())],
+        [t('info.size'), `${s.size.map((v) => v.toFixed(1)).join(' × ')} mm`],
+      ]
+    : [
     [t('info.format'), p.format],
     [t('info.tris'), s.triangles.toLocaleString(locale())],
     [t('info.size'), `${s.size.map((v) => v.toFixed(1)).join(' × ')} mm`],
     [t('info.closed'), s.openEdges ? t('info.closed.no', { n: s.openEdges }) : t('info.closed.yes')],
-    [t('info.volume'), s.openEdges ? '—' : `${(s.volume / 1e6).toFixed(2)} L`],
-  ];
+        [t('info.volume'), s.openEdges ? '—' : `${(s.volume / 1e6).toFixed(2)} L`],
+      ];
   const dl = document.createElement('dl');
   dl.className = 'info';
   for (const [k, v] of rows)
@@ -737,6 +794,12 @@ async function analyze(which: Part[] = parts) {
   }
   for (const p of which) {
     if (!parts.includes(p)) continue;
+    if (p.path) {
+      // Nothing to analyse: the path is printed the way it was made.
+      Object.assign(p, { orientations: [asMade()], orientIdx: 0, split: null, wantDown: undefined, preferDown: undefined });
+      if (!p.placed) placeNewPart(p);
+      continue;
+    }
     const m = p.mesh;
     let res: { orientations: OrientationCandidate[]; split: SplitPlan | null };
     try {
@@ -762,7 +825,7 @@ async function analyze(which: Part[] = parts) {
     p.wantDown = undefined;
     if (!p.placed) placeNewPart(p);
   }
-  for (const id of ['step-orient', 'step-print', 'step-robot', 'step-out']) $(id).hidden = false;
+  for (const id of ['step-print', 'step-robot', 'step-out']) $(id).hidden = false;
   selectPart(Math.max(0, Math.min(active, parts.length - 1)));
   return build();
 }
@@ -1240,18 +1303,49 @@ interface BuildMsg {
  * Several parts: each one oriented, turned and placed in BASE, merged into one mesh that is
  * printed layer by layer (the computation re-centres it on its own centre).
  */
-function assembly(): { mesh: MeshData; matrix: Mat3; robot: RobotSettings; name: string; notes: Msg[]; boxes?: PartBox[] } {
+/** The path of an imported part in the frame of its (scaled) beads. */
+function scaledPath(p: Part): ImportedPath {
+  const path = p.path!;
+  return p.scale === 1 ? path : { ...path, xyz: path.xyz.map((v) => v * p.scale) };
+}
+
+function assembly(): { mesh: MeshData; matrix: Mat3; robot: RobotSettings; name: string; notes: Msg[]; boxes?: PartBox[]; paths?: (ImportedPath | null)[] } {
   const name = parts.map((p) => p.name).join(' + ');
+  // The beads of an imported path follow the bead settings.
+  for (const p of parts)
+    if (p.path && p.beads !== beadsKey()) {
+      p.original = pathProxy(p.path, print);
+      p.mesh = p.scale === 1 ? p.original : scale(p.original, p.scale);
+      p.beads = beadsKey();
+    }
+  const some = parts.some((p) => p.path);
   if (parts.length === 1) {
     const p = parts[0];
-    return { mesh: p.mesh, matrix: orientedMatrix(p), robot: structuredClone({ ...robot, originX: p.x, originY: p.y, rotationZ: p.rotZ }), name, notes: [] };
+    return { mesh: p.mesh, matrix: orientedMatrix(p), robot: structuredClone({ ...robot, originX: p.x, originY: p.y, rotationZ: p.rotZ }), name, notes: [], paths: p.path ? [scaledPath(p)] : undefined };
   }
   const boxes: PartBox[] = [];
+  const paths: (ImportedPath | null)[] = [];
   const placed = parts.map((p) => {
-    const m = dropToOrigin(applyMatrix(p.mesh, mulMat3(rotZ(p.rotZ), orientedMatrix(p))));
+    const turn = mulMat3(rotZ(p.rotZ), orientedMatrix(p));
+    const turned = applyMatrix(p.mesh, turn);
+    const m = dropToOrigin(turned);
     const [x, y] = robot.placement === 'file' ? placementOffset(p.mesh, robot) : [p.x, p.y];
     const b = computeBounds(m);
     boxes.push([b.min[0] + x, b.min[1] + y, b.max[0] + x, b.max[1] + y]);
+    if (p.path) {
+      // The path goes with its beads: turned, centred like them, put where the part is.
+      const tb = computeBounds(turned);
+      const [cx, cy] = [(tb.min[0] + tb.max[0]) / 2, (tb.min[1] + tb.max[1]) / 2];
+      const src = scaledPath(p).xyz;
+      const xyz = new Float32Array(src.length);
+      for (let i = 0; i < src.length; i += 3) {
+        const [px, py, pz] = [src[i], src[i + 1], src[i + 2]];
+        xyz[i] = turn[0] * px + turn[1] * py + turn[2] * pz - cx + x;
+        xyz[i + 1] = turn[3] * px + turn[4] * py + turn[5] * pz - cy + y;
+        xyz[i + 2] = turn[6] * px + turn[7] * py + turn[8] * pz;
+      }
+      paths.push({ ...p.path, xyz });
+    } else paths.push(null);
     return translate(m, x, y, 0);
   });
   // Overlapping parts are a blocking error of the build (pipeline.ts).
@@ -1259,7 +1353,7 @@ function assembly(): { mesh: MeshData; matrix: Mat3; robot: RobotSettings; name:
   const all = mergeMeshes(placed);
   const b = computeBounds(all);
   const r = { ...robot, placement: 'origin' as const, originX: (b.min[0] + b.max[0]) / 2, originY: (b.min[1] + b.max[1]) / 2, rotationZ: 0 };
-  return { mesh: all, matrix: [...IDENTITY] as Mat3, robot: structuredClone(r), name, notes, boxes };
+  return { mesh: all, matrix: [...IDENTITY] as Mat3, robot: structuredClone(r), name, notes, boxes, paths: some ? paths : undefined };
 }
 /** Warnings about the arrangement of the parts (overlaps), shown with the result. */
 let assemblyNotes: Msg[] = [];
@@ -1280,7 +1374,7 @@ async function build(): Promise<BuildMsg | null> {
   let r: BuildMsg;
   try {
     r = await busy(t('busy.path'), () =>
-      run<BuildMsg>('build', { type: 'build', mesh: job.mesh, matrix: job.matrix, print: { ...print }, robot: job.robot, sourceName: job.name, bodies, partBoxes: job.boxes, edits: pathEdits ?? undefined }),
+      run<BuildMsg>('build', { type: 'build', mesh: job.mesh, matrix: job.matrix, print: { ...print }, robot: job.robot, sourceName: job.name, bodies, partBoxes: job.boxes, edits: pathEdits ?? undefined, paths: job.paths }),
     );
   } catch (e) {
     if (!(e instanceof Superseded) && seq === buildSeq) $('warnings').replaceChildren(li(tm(errText(e))));

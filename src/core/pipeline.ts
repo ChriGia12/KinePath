@@ -2,16 +2,17 @@
 import { msg, SettingsError, type Msg } from '../i18n';
 import { validateSettings } from './validate';
 import { supportProgramName, writeKukaSrc } from './kuka';
-import { applyMatrix, computeBounds, cutBelow, dropToOrigin, mulMat3, openEdgeLift, rotZ, translate, type Mat3, type MeshData } from './mesh';
+import { applyMatrix, computeBounds, cutBelow, dropToOrigin, mergeMeshes, mulMat3, openEdgeLift, rotZ, translate, type Mat3, type MeshData } from './mesh';
 import type { PrintSettings, RobotSettings } from './settings';
 import { reachReport, type ReachReport } from './robot';
-import { buildPlanar, buildToolpath, sliceForPrint, spiralRange, type Toolpath } from './toolpath';
+import { buildPlanar, buildToolpath, sliceForPrint, spiralRange, type PathPoint, type Toolpath } from './toolpath';
 import { riskZones, type Zones } from './zones';
-import { boxesOverlap, joinInTurn, printPartsInTurn, type PartBox } from './parts';
+import { boxesOverlap, joinInTurn, printPartsInTurn, splitByBoxes, type PartBox } from './parts';
 import { tiltAlongWalls } from './tilt';
 import { evaluateOrientation, OVERHANG_LIMIT, supportOk } from './orientation';
 import { collisionReport, type Body, type CollisionReport } from './collision';
 import { applyEdits, pathSignature, type PathEdits } from './edits';
+import { importedToolpath, type ImportedPath } from './imported';
 import { resolveStrategy } from './strategy';
 
 export interface BuildResult {
@@ -44,6 +45,8 @@ export interface BuildResult {
   editsDropped: boolean;
 }
 
+const mergeOrNull = (meshes: MeshData[]) => (meshes.length ? mergeMeshes(meshes) : null);
+
 /** Where the local part frame lands in BASE coordinates. */
 export function placementOffset(original: MeshData, r: RobotSettings): [number, number, number] {
   if (r.placement === 'origin') return [r.originX, r.originY, r.originZ];
@@ -68,23 +71,57 @@ export function runBuild(
   partBoxes?: PartBox[],
   /** Changes made by hand to the path (edits.ts): applied only to the path they were made on. */
   edits?: PathEdits,
+  /**
+   * Parts that are a path made elsewhere (imported.ts), in the frame of `original`: one per part
+   * (null for a part to compute). `original` then holds, for them, the beads of the path.
+   */
+  paths?: (ImportedPath | null)[],
 ): BuildResult {
   // Parameters are checked before any geometry: an out-of-range value (e.g. thousands of passes)
   // must not start a computation that could take minutes or exhaust memory.
   const invalid = validateSettings(print, robot);
   if (invalid.length) throw new SettingsError(invalid);
-  let mesh = dropToOrigin(applyMatrix(original, mulMat3(rotZ(robot.rotationZ), matrix)));
+  const turn = mulMat3(rotZ(robot.rotationZ), matrix);
+  const turned = applyMatrix(original, turn);
+  let mesh = dropToOrigin(turned);
+  const multi = !!partBoxes && partBoxes.length > 1;
+  const imported = !!paths?.some(Boolean);
+  // A path made elsewhere is taken as it is: nothing of it is cut away.
+  if (imported && print.baseCut > 0) print = { ...print, baseCut: 0 };
   // Base cut (own parts only, chosen on purpose): what is below the plane is not printed.
   if (print.baseCut > 0) mesh = translate(cutBelow(mesh, print.baseCut), 0, 0, -print.baseCut);
   const offset = placementOffset(original, robot);
   const start: [number, number] | undefined =
     print.startMode === 'point' ? [print.startX - offset[0], print.startY - offset[1]] : undefined;
-  const multi = !!partBoxes && partBoxes.length > 1;
+  /**
+   * An imported path in the part frame: turned and centred like its beads. Centred on a point,
+   * its lowest point is one first-layer height above the table; kept where the file has it,
+   * every Z of the file is kept (the world → BASE shift is in `offset`).
+   */
+  const place = (path: ImportedPath): Toolpath => {
+    const b = computeBounds(turned);
+    const [cx, cy] = [(b.min[0] + b.max[0]) / 2, (b.min[1] + b.max[1]) / 2];
+    const n = path.xyz.length / 3;
+    const pts: PathPoint[] = [];
+    let low = Infinity;
+    for (let i = 0; i < n; i++) {
+      const [x, y, z] = [path.xyz[i * 3], path.xyz[i * 3 + 1], path.xyz[i * 3 + 2]];
+      const q = { x: turn[0] * x + turn[1] * y + turn[2] * z - cx, y: turn[3] * x + turn[4] * y + turn[5] * z - cy, z: turn[6] * x + turn[7] * y + turn[8] * z, e: !!path.ext[i] };
+      low = Math.min(low, q.z);
+      pts.push(q);
+    }
+    const dz = robot.placement === 'file' && !multi ? -b.min[2] : print.firstLayerZ - low;
+    for (const q of pts) q.z += dz;
+    return importedToolpath(pts, print, path.hasExtruder);
+  };
+  const given = paths?.map((p) => (p ? place(p) : null));
+  // What is left to check as a solid (overhangs, risk zones): the parts that are not a path.
+  const solid = !imported ? mesh : multi ? mergeOrNull(splitByBoxes(mesh, partBoxes!, offset).filter((m, k) => m && !paths![k]) as MeshData[]) : null;
   // A contour print without an explicit choice: how to lay it is decided from the part (with
   // several parts, each part decides for itself in buildToolpath).
-  const choice = multi ? null : resolveStrategy(mesh, print);
+  const choice = multi || imported ? null : resolveStrategy(mesh, print);
   if (choice) print = choice.settings;
-  const summary = print.mode === 'surface' ? undefined : sliceForPrint(mesh, print);
+  const summary = print.mode === 'surface' || imported ? undefined : sliceForPrint(mesh, print);
   // Supports in a separate program: the part and the supports become two paths, printed one
   // after the other (supports first). Not with several parts or rings following the surface.
   const wantSeparate = print.supports === 'separate';
@@ -104,15 +141,15 @@ export function runBuild(
     toolpath.warnings.push(msg('w.supportsSeparate', { n: supLayers.length, name: supportProgramName(robot.programName) }));
   } else {
     // Several parts: one after the other, each one whole (parts.ts).
-    toolpath = multi ? printPartsInTurn(mesh, print, partBoxes!, offset, start) : buildToolpath(mesh, print, summary, start);
+    toolpath = multi ? printPartsInTurn(mesh, print, partBoxes!, offset, start, given) : given?.[0] ?? buildToolpath(mesh, print, summary, start);
     if (wantSeparate && summary?.supportLayers) toolpath.warnings.push(msg('w.supportsInline'));
   }
   if (choice?.why) toolpath.warnings.push(choice.why);
   if (print.baseCut > 0) toolpath.warnings.push(msg('w.baseCut', { z: print.baseCut }));
-  const zones = riskZones(mesh, summary?.layers ?? null, print);
+  const zones: Zones = solid && !imported ? riskZones(solid, summary?.layers ?? null, print) : { overhang: new Uint32Array(0), islands: new Float32Array(0), thin: new Float32Array(0) };
   const placed: RobotSettings = { ...robot, originX: offset[0], originY: offset[1], originZ: offset[2] };
   // Tool leaning along the walls (every mode but the surface one, which has its own tilt).
-  if (print.toolTilt && toolpath.mode !== 'surface') tiltAlongWalls(toolpath, mesh, print);
+  if (print.toolTilt && toolpath.mode !== 'surface' && !imported) tiltAlongWalls(toolpath, mesh, print);
   // Changes made by hand: only on the very path they were made on, and before every check.
   const baseSig = pathSignature(toolpath);
   let edited = 0;
@@ -167,13 +204,13 @@ export function runBuild(
   if (reach.jumps) toolpath.warnings.push(msg('w.jumps', { n: reach.jumps }));
   if (toolpath.tiltX) toolpath.warnings.push(msg('w.tiltX', { n: toolpath.tiltX }));
   // An open edge (hull rim, bowl lip) that touches the table only in part: say where to cut.
-  const lift = openEdgeLift(mesh);
+  const lift = imported ? 0 : openEdgeLift(mesh);
   if (lift > 1 && print.supports === 'none') toolpath.warnings.push(msg('w.openEdgeLift', { z: Math.ceil(lift) }));
   // Same hard checks as the orientation ranking, on the orientation actually printed. The
   // surface mode prints on top of an existing part: its overhangs are not printed here.
   let support: BuildResult['support'] = null;
-  if (toolpath.mode !== 'surface') {
-    const e = evaluateOrientation(mesh, [0, 0, -1], print.overhangAngle, print.layerHeight, print.thinWallMax);
+  if (toolpath.mode !== 'surface' && solid) {
+    const e = evaluateOrientation(solid, [0, 0, -1], print.overhangAngle, print.layerHeight, print.thinWallMax);
     if (!supportOk(e)) {
       const overhang = e.totalArea ? (e.overhangArea / e.totalArea) * 100 : 0;
       support = { islands: e.unsupported, overhang: +overhang.toFixed(1) };
