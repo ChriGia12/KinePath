@@ -7,9 +7,10 @@ import rhino3dm from 'rhino3dm';
 import { curvesToPath, moveSeam, parseSrc, pathProxy, pathUnits, tiltFromPath, importedToolpath } from '../src/core/imported';
 import { parse3dm } from '../src/core/loaders';
 import type { PathPoint } from '../src/core/toolpath';
-import { computeBounds, IDENTITY, type Mat3 } from '../src/core/mesh';
+import { computeBounds, IDENTITY, weld, type Mat3 } from '../src/core/mesh';
 import { runBuild } from '../src/core/pipeline';
 import { DEFAULT_PRINT, DEFAULT_ROBOT } from '../src/core/settings';
+import { box } from './fixtures';
 
 const header = JSON.parse(readFileSync('public/cell.json', 'utf8')) as { parts: CellPart[] };
 const cell = readFileSync('public/cell.bin');
@@ -109,6 +110,55 @@ describe('the program written around an imported path', () => {
     const r = runBuild(pathProxy(p, DEFAULT_PRINT), I, DEFAULT_PRINT, { ...DEFAULT_ROBOT, placement: 'file' }, 'x.src', bodies, undefined, undefined, [p]);
     expect(r.src).not.toContain('; ACCENSIONE ESTRUSORE');
     expect(r.src).toContain('RIACCENSIONE ESTRUSORE');
+  });
+});
+
+describe('a path with the object it was drawn on', () => {
+  // the object: a 100 mm block standing in the Rhino world, its base at Z 5; the path: two loops
+  // around it, 1.5 and 3 mm above its base
+  const block = box(100, 100, 50, 1400, -500, 5);
+  const loops = [6.5, 8].map((z) => Float32Array.from([[1400, -500], [1500, -500], [1500, -400], [1400, -400], [1400, -500]].flatMap(([x, y]) => [x, y, z])));
+  const path = { ...curvesToPath(loops, 8)!, ref: true };
+  const zs = (src: string) => src.split('\r\n').filter((l) => l.startsWith('LIN {')).map((l) => ['X', 'Y', 'Z'].map((a) => parseFloat(new RegExp(`${a} (-?[\\d.]+)`).exec(l)![1])));
+
+  it('the object rests on the plate and the path keeps its height on it', () => {
+    const robot = { ...DEFAULT_ROBOT, originX: 0, originY: 500 };
+    const r = runBuild(block, I, DEFAULT_PRINT, robot, 'p.3dm', bodies, undefined, undefined, [path]);
+    const pts = zs(r.src);
+    // 1.5 mm above the base of the object, which is on the plate (Z 38): not pushed down to 0.5
+    expect(Math.min(...pts.map((p) => p[2]))).toBeCloseTo(38 + 1.5, 3);
+    expect(Math.max(...pts.map((p) => p[2]))).toBeCloseTo(38 + 3, 3);
+    // around the object, centred where the object is put
+    expect([Math.min(...pts.map((p) => p[0])), Math.max(...pts.map((p) => p[0]))]).toEqual([-50, 50]);
+    expect([Math.min(...pts.map((p) => p[1])), Math.max(...pts.map((p) => p[1]))]).toEqual([450, 550]);
+    // the object is shown, and is never printed: only the 10 points of the two loops
+    expect(r.toolpath.points.length).toBe(10);
+    expect(r.toolpath.mode).toBe('imported');
+    expect(r.mesh.indices.length).toBe(block.indices.length);
+  });
+
+  it('the tool can stand along the normal of the object where the path is laid on its surface', () => {
+    // a ramp: a quad rising 30° along Y (normal leaning 30° towards −Y), and passes drawn on it
+    const rise = Math.tan(Math.PI / 6) * 100;
+    const ramp = weld({ positions: new Float32Array([0, 0, 0, 100, 0, 0, 100, 100, rise, 0, 100, rise]), indices: new Uint32Array([0, 1, 2, 0, 2, 3]) });
+    const passes = [20, 40, 60, 80].map((y) => Float32Array.from([[10, y], [90, y]].flatMap(([x, yy]) => [x, yy, (yy / 100) * rise])));
+    const onRamp = { ...curvesToPath(passes, 0)!, ref: true };
+    const tilt = (maxTilt: number) => runBuild(ramp, I, { ...DEFAULT_PRINT, toolTilt: true, maxTilt }, { ...DEFAULT_ROBOT, originX: 0, originY: 500 }, 'r.3dm', undefined, undefined, undefined, [onRamp]);
+    const r = tilt(45);
+    expect(r.toolpath.warnings.map((w) => w.k)).toContain('i.tiltOnObject');
+    // every pass leans 30° from the vertical, all the same way (the slope is along Y: C can follow it)
+    const cs = r.toolpath.points.filter((p) => p.e).map((p) => p.c!);
+    for (const c of cs) expect(Math.abs(Math.abs(c - 180) - 30)).toBeLessThan(0.5);
+    expect(new Set(cs.map((c) => Math.sign(c - 180))).size).toBe(1);
+    expect(r.toolpath.tiltX ?? 0).toBe(0);
+    // never more than the maximum tilt
+    for (const p of tilt(15).toolpath.points.filter((q) => q.e)) expect(Math.abs(Math.abs(p.c! - 180) - 15)).toBeLessThan(0.5);
+  });
+
+  it('without the object the lowest point of the path is laid just above the plate', () => {
+    const alone = { ...path, ref: false };
+    const r = runBuild(pathProxy(alone, DEFAULT_PRINT), I, DEFAULT_PRINT, DEFAULT_ROBOT, 'p.3dm', bodies, undefined, undefined, [alone]);
+    expect(Math.min(...zs(r.src).map((p) => p[2]))).toBeCloseTo(38 + DEFAULT_PRINT.firstLayerZ, 3);
   });
 });
 

@@ -138,6 +138,47 @@ export function tiltAlongWalls(tp: Toolpath, mesh: MeshData, s: PrintSettings): 
 }
 
 /**
+ * Tool tilt for a path laid on an object that is given with it (an imported path with its
+ * reference model): at every point the nearest face of the object tells how to hold the tool.
+ * On a surface the bead is laid on (a face within 60° of the horizontal) the tool stands along
+ * its normal; beside a wall it leans along the wall, as in tiltAlongWalls. Both up to maxTilt;
+ * far from any face the tool stays vertical. Returns how many points got a lean.
+ */
+export function tiltOnObject(tp: Toolpath, mesh: MeshData, s: Pick<PrintSettings, 'maxTilt' | 'wallSpacing' | 'layerHeight'>): number {
+  const pts = tp.points;
+  if (!pts.length || s.maxTilt <= 0) return 0;
+  const grid = new FaceGrid(mesh, Math.max(4, 2 * s.wallSpacing));
+  const radius = Math.max(10, 3 * s.layerHeight, 1.5 * s.wallSpacing);
+  const p = mesh.positions;
+  const ix = mesh.indices;
+  const maxTilt = (s.maxTilt * Math.PI) / 180;
+  let leaning = 0;
+  const dirs = pts.map((q): V3 => {
+    const t = grid.nearest([q.x, q.y, q.z], radius);
+    if (t < 0) return [0, 0, 1];
+    const [a, b, c] = [ix[t * 3], ix[t * 3 + 1], ix[t * 3 + 2]];
+    const u = [p[b * 3] - p[a * 3], p[b * 3 + 1] - p[a * 3 + 1], p[b * 3 + 2] - p[a * 3 + 2]];
+    const w = [p[c * 3] - p[a * 3], p[c * 3 + 1] - p[a * 3 + 1], p[c * 3 + 2] - p[a * 3 + 2]];
+    const n = [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+    const len = Math.hypot(n[0], n[1], n[2]) || 1;
+    let [nx, ny, nz] = [n[0] / len, n[1] / len, n[2] / len];
+    // The axis to follow: the normal of a surface (turned upwards), or up along a wall.
+    let v: V3;
+    if (Math.abs(nz) >= 0.5) {
+      if (nz < 0) [nx, ny, nz] = [-nx, -ny, -nz];
+      v = [nx, ny, nz];
+    } else v = [-nz * nx, -nz * ny, 1 - nz * nz];
+    const h = Math.hypot(v[0], v[1]);
+    if (h < 1e-9 || v[2] <= 0) return [0, 0, 1];
+    const lean = Math.min(Math.atan2(h, v[2]), maxTilt);
+    if (lean > 0.02) leaning++;
+    return [(v[0] / h) * Math.sin(lean), (v[1] / h) * Math.sin(lean), Math.cos(lean)];
+  });
+  assignTilt(tp, dirs);
+  return leaning;
+}
+
+/**
  * Sets the C of every point from the direction the tool axis should have there (unit vectors,
  * part frame): smoothed along the path so the wrist turns gradually, then turned into C.
  */

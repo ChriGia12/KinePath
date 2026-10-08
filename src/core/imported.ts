@@ -14,6 +14,11 @@ export interface ImportedPath {
   ext: Uint8Array;
   /** The file switches the extruder itself ($OUT[16] / $ANOUT[7]); otherwise every move prints. */
   hasExtruder: boolean;
+  /**
+   * The mesh given with the path is the object it was drawn on (a reference, never used to compute
+   * a path): the object rests on the plate and the path keeps its place on it, height included.
+   */
+  ref?: boolean;
 }
 
 const NUM = String.raw`(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)`;

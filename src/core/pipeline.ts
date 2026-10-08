@@ -8,7 +8,7 @@ import { reachReport, type ReachReport } from './robot';
 import { buildPlanar, buildToolpath, sliceForPrint, spiralRange, type PathPoint, type Toolpath } from './toolpath';
 import { riskZones, type Zones } from './zones';
 import { boxesOverlap, joinInTurn, printPartsInTurn, splitByBoxes, type PartBox } from './parts';
-import { tiltAlongWalls } from './tilt';
+import { tiltAlongWalls, tiltOnObject } from './tilt';
 import { evaluateOrientation, OVERHANG_LIMIT, supportOk } from './orientation';
 import { collisionReport, type Body, type CollisionReport } from './collision';
 import { applyEdits, pathSignature, type PathEdits } from './edits';
@@ -94,9 +94,10 @@ export function runBuild(
   const start: [number, number] | undefined =
     print.startMode === 'point' ? [print.startX - offset[0], print.startY - offset[1]] : undefined;
   /**
-   * An imported path in the part frame: turned and centred like its beads. Centred on a point,
-   * its lowest point is one first-layer height above the table; kept where the file has it,
-   * every Z of the file is kept (the world → BASE shift is in `offset`).
+   * An imported path in the part frame: turned and centred like its mesh (its beads, or the
+   * object it was drawn on). Centred on a point, its lowest point is one first-layer height above
+   * the table — or, with its object, where it is on the object; kept where the file has it, every
+   * Z of the file is kept (the world → BASE shift is in `offset`).
    */
   const place = (path: ImportedPath): Toolpath => {
     const b = computeBounds(turned);
@@ -110,15 +111,18 @@ export function runBuild(
       low = Math.min(low, q.z);
       pts.push(q);
     }
-    const dz = robot.placement === 'file' && !multi ? -b.min[2] : print.firstLayerZ - low;
+    // With the object it was drawn on, the path keeps its height on the object (which rests on
+    // the plate); alone, its lowest point is laid one first-layer height above the plate.
+    const dz = path.ref || (robot.placement === 'file' && !multi) ? -b.min[2] : print.firstLayerZ - low;
     for (const q of pts) q.z += dz;
     // A start point chosen by hand: every closed loop of the path starts nearest to it.
     const seam = start ? moveSeam(pts, start) : null;
     if (seam) pts = seam.points;
     const tp = importedToolpath(pts, print, path.hasExtruder);
     if (seam) tp.warnings.push(msg(seam.moved ? 'i.seamMoved' : 'i.seamNone', { n: seam.moved, open: seam.open }));
-    // Tool leaning along the wall: the wall is read from the path, layer over layer.
-    if (print.toolTilt) tp.warnings.push(msg('i.tiltFromPath', { n: tiltFromPath(tp, print) }));
+    // With its object, the object tells: along the normal of the surface the bead is laid on,
+    // along the wall beside a wall. Alone, the wall is read from the path, layer over layer.
+    if (print.toolTilt) tp.warnings.push(path.ref ? msg('i.tiltOnObject', { n: tiltOnObject(tp, mesh, print) }) : msg('i.tiltFromPath', { n: tiltFromPath(tp, print) }));
     return tp;
   };
   const given = paths?.map((p) => (p ? place(p) : null));

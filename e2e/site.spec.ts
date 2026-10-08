@@ -435,3 +435,45 @@ test('an imported path can be changed: start point, tool leaning; curves of a Rh
   expect(Math.max(...r.cs.map((c) => Math.abs(c - 180)))).toBeGreaterThan(10);
 });
 
+test('a Rhino file with the path and its object: the object is only a reference, the path keeps its height on it', async ({ page }) => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const rhino = (await ((await import('rhino3dm')).default as any)()) as any;
+  const doc = new rhino.File3dm();
+  for (const name of ['Predefinita', 'Percorso']) {
+    const l = new rhino.Layer();
+    l.name = name;
+    doc.layers().add(l);
+  }
+  const on = (k: number) => {
+    const a = new rhino.ObjectAttributes();
+    a.layerIndex = k;
+    return a;
+  };
+  // the object: a block 100 × 100 × 50 standing on the work table of the Rhino scene (BASE at
+  // 1448, −1000, 5: its base is at world Z 43, the top of the plate)
+  const m = new rhino.Mesh();
+  for (const v of [[0, 0, 0], [100, 0, 0], [100, 100, 0], [0, 100, 0], [0, 0, 50], [100, 0, 50], [100, 100, 50], [0, 100, 50]]) m.vertices().add(1400 + v[0], -500 + v[1], 43 + v[2]);
+  for (const f of [[0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7], [0, 1, 5], [0, 5, 4], [1, 2, 6], [1, 6, 5], [2, 3, 7], [2, 7, 6], [3, 0, 4], [3, 4, 7]]) m.faces().addTriFace(f[0], f[1], f[2]);
+  doc.objects().addMesh(m, on(0));
+  // the path baked from a contour: loops around the object every 1.5 mm, the first 1.5 mm above its base
+  for (let k = 1; k <= 4; k++) {
+    const pl = new rhino.Polyline();
+    for (const [x, y] of [[0, 0], [100, 0], [100, 100], [0, 100], [0, 0]]) pl.add(1400 + x, -500 + y, 43 + 1.5 * k);
+    doc.objects().addCurve(pl.toPolylineCurve(), on(1));
+  }
+  await page.setInputFiles('#file', { name: 'blocco con percorso.3dm', mimeType: 'application/octet-stream', buffer: Buffer.from(doc.toByteArray()) });
+  await expect(download(page)).toBeEnabled({ timeout: 30_000 });
+  await expect(page.locator('#modelNotes')).toContainText('4 curve del layer «Percorso»');
+  await expect(page.locator('#modelNotes')).toContainText('modello di riferimento');
+  await expect(stat(page, 'Modo scelto')).toContainText('Percorso importato');
+  // the object is shown with its own size, and is not printed: 20 points, those of the 4 loops
+  await expect(page.locator('#modelInfo')).toContainText('100.0 × 100.0 × 50.0 mm');
+  await expect(stat(page, 'Punti LIN')).toHaveText('20');
+  const [dl] = await Promise.all([page.waitForEvent('download'), download(page).click()]);
+  const lins = readFileSync((await dl.path())!, 'utf8').split('\r\n').filter((l) => l.startsWith('LIN {'));
+  const z = lins.map((l) => parseFloat(/Z (-?[\d.]+)/.exec(l)![1]));
+  // the object rests on the plate (Z 38): the path is 1.5 … 6 mm above it, as drawn
+  expect(Math.min(...z)).toBe(39.5);
+  expect(Math.max(...z)).toBe(44);
+});
+

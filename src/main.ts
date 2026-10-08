@@ -114,6 +114,11 @@ interface Part {
   beads?: string;
   /** The curves the path was made from (a Rhino file): the path follows «Salto senza stop». */
   curves?: Float32Array[];
+  /**
+   * `original` / `mesh` are the object the path was drawn on (from the same file): shown and
+   * placed with the path, which keeps its place on it. Never used to compute a path.
+   */
+  ref?: boolean;
 }
 let parts: Part[] = [];
 let active = -1;
@@ -288,6 +293,13 @@ async function readPart(name: string, bytes: ArrayBuffer): Promise<Part> {
     const path = curvesToPath(model.curves, print.maxBridge);
     if (!path) throw new MsgError(msg('e.noPrintable'));
     const info = { n: model.curves.length, p: path.xyz.length / 3, layer: model.pathLayer ?? '' };
+    // The object the path was drawn on, when the file has it (of a whole scene: what stands on
+    // the work table): a reference to see and place the path, which keeps its place on it.
+    const object = model.parts.length ? pickPieces(model, cellRegion()).parts : [];
+    if (object.length) {
+      const original = combineParts(object);
+      return { ...pathPart({ ...path, ref: true }, '3DM', msg('n.importedCurvesRef', info)), curves: model.curves, ref: true, original, mesh: original };
+    }
     return { ...pathPart(path, '3DM', msg(model.pathLayer ? 'n.importedCurvesLayer' : 'n.importedCurves', info)), curves: model.curves };
   }
   const { parts: pieces, note } = pickPieces(model, cellRegion());
@@ -1327,9 +1339,12 @@ function assembly(): { mesh: MeshData; matrix: Mat3; robot: RobotSettings; name:
   // The beads of an imported path follow the bead settings.
   for (const p of parts)
     if (p.path && p.beads !== beadsKey()) {
-      if (p.curves) p.path = curvesToPath(p.curves, print.maxBridge) ?? p.path;
-      p.original = pathProxy(p.path, print);
-      p.mesh = p.scale === 1 ? p.original : scale(p.original, p.scale);
+      const again = p.curves ? curvesToPath(p.curves, print.maxBridge) : null;
+      if (again) p.path = { ...again, ref: p.ref };
+      if (!p.ref) {
+        p.original = pathProxy(p.path, print);
+        p.mesh = p.scale === 1 ? p.original : scale(p.original, p.scale);
+      }
       p.beads = beadsKey();
     }
   const some = parts.some((p) => p.path);
@@ -1347,7 +1362,7 @@ function assembly(): { mesh: MeshData; matrix: Mat3; robot: RobotSettings; name:
     const b = computeBounds(m);
     boxes.push([b.min[0] + x, b.min[1] + y, b.max[0] + x, b.max[1] + y]);
     if (p.path) {
-      // The path goes with its beads: turned, centred like them, put where the part is.
+      // The path goes with its mesh (its beads, or its object): turned, centred like it, put where the part is.
       const tb = computeBounds(turned);
       const [cx, cy] = [(tb.min[0] + tb.max[0]) / 2, (tb.min[1] + tb.max[1]) / 2];
       const src = scaledPath(p).xyz;
@@ -1356,7 +1371,8 @@ function assembly(): { mesh: MeshData; matrix: Mat3; robot: RobotSettings; name:
         const [px, py, pz] = [src[i], src[i + 1], src[i + 2]];
         xyz[i] = turn[0] * px + turn[1] * py + turn[2] * pz - cx + x;
         xyz[i + 1] = turn[3] * px + turn[4] * py + turn[5] * pz - cy + y;
-        xyz[i + 2] = turn[6] * px + turn[7] * py + turn[8] * pz;
+        // With its object the path keeps its height on it (the object rests on the plate).
+        xyz[i + 2] = turn[6] * px + turn[7] * py + turn[8] * pz - (p.ref ? tb.min[2] : 0);
       }
       paths.push({ ...p.path, xyz });
     } else paths.push(null);
