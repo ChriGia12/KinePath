@@ -305,3 +305,14 @@ test('supports in their own program: the simulation plays the real change of pro
   expect(at('homing tra i due programmi')).toBeGreaterThan(at('fine programma supporti'));
   expect(at(`PTP ${k + 1} /`)).toBeGreaterThan(at('homing tra i due programmi'));
 });
+
+test('a thin wall is printed along its middle, one pass per layer', async ({ page }) => {
+  await addPart(page, 'parete.stl', 120, 6, 9);
+  await expect(download(page)).toBeEnabled();
+  await expect(page.locator('#warnings')).toContainText('Pareti sottili stampate sulla linea media');
+  // one pass of 120 mm per layer instead of a loop around the wall (about 250 mm)
+  const metres = parseFloat((await stat(page, 'Lunghezza stampa').innerText()).replace(',', '.'));
+  expect(metres).toBeLessThan(0.9);
+  await expect(page.locator('#printFields')).toContainText('Reticoli');
+});
+

@@ -954,6 +954,16 @@ const PRINT_FIELDS: Field[] = [
   { key: 'travelLift', label: 'f.travelLift', kind: 'number', step: 1, min: 0 },
   { key: 'overhangAngle', label: 'f.overhangAngle', kind: 'number', step: 1, min: 1 },
   { key: 'thinWallMax', label: 'f.thinWallMax', kind: 'number', step: 1, min: 0 },
+  {
+    key: 'latticeRetrace',
+    label: 'f.latticeRetrace',
+    kind: 'select',
+    full: true,
+    options: [
+      ['off', 'lattice.off'],
+      ['print', 'lattice.print'],
+    ],
+  },
   { group: 'g.serpentine' },
   { key: 'fillAngle', label: 'f.fillAngle', kind: 'number', step: 15 },
   { key: 'fillAlternate', label: 'f.fillAlternate', kind: 'check', full: true },
@@ -1532,7 +1542,7 @@ function statsItems(r: BuildMsg): [string, string, boolean?][] {
   const tp = r.meta;
   const seconds = (tp.printLength + tp.travelLength) / (robot.velCP * 1000) + tp.travels * robot.extruderDelay;
   const kb = new Blob([r.src]).size / 1024;
-  const stops = ' ' + (tp.travels ? t('r.stops', { n: tp.travels }) : t('r.noStops')) + (tp.partChanges ? ' ' + t('r.partChanges', { n: tp.partChanges }) : '');
+  const stops = ' ' + (tp.travels ? t('r.stops', { n: tp.travels }) : tp.retraces && print.latticeRetrace !== 'print' ? t('r.noJumps') : t('r.noStops')) + (tp.partChanges ? ' ' + t('r.partChanges', { n: tp.partChanges }) : '') + (tp.retraces ? ' ' + t(print.latticeRetrace === 'print' ? 'r.retracesPrint' : 'r.retraces', { n: tp.retraces }) : '');
   const items: [string, string, boolean?][] = [
     [t('r.mode'), t(`r.mode.${tp.mode}`) + stops, true],
     [t('r.layers'), `${tp.layerCount}`],

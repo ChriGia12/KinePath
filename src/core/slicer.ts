@@ -10,6 +10,8 @@ export interface Contour {
   depth: number;
   /** Removable support added under something that hangs (not part of the mesh). */
   support?: boolean;
+  /** Walk along the mid-lines of a thin-walled network (lattice.ts): walls may appear twice. */
+  lattice?: boolean;
 }
 
 export interface Layer {

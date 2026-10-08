@@ -7,6 +7,7 @@ import type { PrintMode, PrintSettings } from './settings';
 import { cFromNormal, HeightField, topSurfacePasses, type SurfaceOptions, type SurfacePoint, type SurfaceRun } from './surface';
 import { sliceAt, type Contour, type Layer } from './slicer';
 import { buildWalls, collapseThinWalls, coverContours, islands, offsetContours } from './walls';
+import { collapseLattices } from './lattice';
 import { scanFill, serpentine } from './zigzag';
 import { buildRings } from './rings';
 import { addSupports } from './supports';
@@ -51,6 +52,8 @@ export interface Toolpath {
   tiltX?: number;
   /** Several parts: moves from one part to the next (PTP above the parts, extruder off). */
   partChanges?: number;
+  /** Thin-walled networks: walls passed a second time (extruder off unless set to print them). */
+  retraces?: number;
 }
 
 export interface LayerSummary {
@@ -65,6 +68,8 @@ export interface LayerSummary {
   dropped: number;
   /** Layers where supports were added. */
   supportLayers: number;
+  /** Layers with a thin-walled network printed along its mid-lines (lattice.ts). */
+  latticeLayers: number;
 }
 
 /** Contour taken at mid-bead height (i + ½)·h; nozzle at firstLayerZ + i·h above the table. */
@@ -77,10 +82,11 @@ export function sliceForPrint(mesh: MeshData, s: PrintSettings): LayerSummary {
   // The whole mesh is printed: every section as it is (no base invented under it, no sliver
   // dropped). Only a minimum length set on purpose by the user leaves contours out, and says so.
   let dropped = 0;
+  const thin = s.mode === 'zigzag' ? 0 : s.thinWallMax;
   const layers = raw.map((l, i) => ({
     z: s.firstLayerZ + i * s.layerHeight,
     // A solid filled layer must keep its real outline: no shell → mid-line collapse there.
-    contours: collapseThinWalls(l.contours, s.mode === 'zigzag' ? 0 : s.thinWallMax).filter((c) => {
+    contours: collapseLattices(collapseThinWalls(l.contours, thin), thin).filter((c) => {
       const keep = polylineLength(c.pts, c.closed) >= s.minContourLength;
       if (!keep) dropped++;
       return keep;
@@ -89,16 +95,18 @@ export function sliceForPrint(mesh: MeshData, s: PrintSettings): LayerSummary {
   let maxIslands = 0;
   let openLayers = 0;
   let emptyLayers = 0;
+  let latticeLayers = 0;
   for (const l of layers) {
     const outers = l.contours.filter((c) => c.closed && c.depth % 2 === 0).length;
     maxIslands = Math.max(maxIslands, outers);
-    if (l.contours.some((c) => !c.closed)) openLayers++;
+    if (l.contours.some((c) => !c.closed && !c.lattice)) openLayers++;
+    if (l.contours.some((c) => c.lattice)) latticeLayers++;
     if (!l.contours.length) emptyLayers++;
   }
   // Supports are added after the counts above: they are not part of the mesh.
   const supportLayers = s.supports !== 'none' ? addSupports(layers, s.layerHeight, s.wallSpacing, s.overhangAngle) : 0;
   const spiral = supportLayers ? null : spiralRange(layers);
-  return { layers, singleLoop: spiral !== null, spiral, maxIslands, openLayers, emptyLayers, dropped, supportLayers };
+  return { layers, singleLoop: spiral !== null, spiral, maxIslands, openLayers, emptyLayers, dropped, supportLayers, latticeLayers };
 }
 
 const isSingleLoop = (l: Layer) => l.contours.length === 1 && l.contours[0].closed;
@@ -154,6 +162,7 @@ export function buildToolpath(
   if (summary.emptyLayers) warnings.push(msg('w.emptyLayers', { n: summary.emptyLayers }));
   if (summary.dropped) warnings.push(msg('w.dropped', { n: summary.dropped, mm: s.minContourLength }));
   if (summary.supportLayers) warnings.push(msg('w.supports', { n: summary.supportLayers }));
+  if (summary.latticeLayers) warnings.push(msg(s.latticeRetrace === 'print' ? 'w.latticePrint' : 'w.lattice', { n: summary.latticeLayers }));
 
   const b = computeBounds(mesh);
   const start: Vec2 = startTarget ?? [b.min[0], b.min[1]];
@@ -317,6 +326,19 @@ export function buildPlanar(tp: Toolpath, layers: Layer[], s: PrintSettings, sta
     const closed = layer.contours.filter((c) => c.closed);
     const inside = insideLayers(layer.contours, below, s);
     if (layer.contours.length) below = layer.contours;
+    // A walk right above where the layer below ended goes first: no jump to come back to it.
+    const walks = new Set(layer.contours.filter((c) => c.lattice));
+    for (let near = true; near && walks.size; ) {
+      near = false;
+      for (const c of walks) {
+        const ends = [c.pts[0], c.pts[c.pts.length - 1]];
+        if (Math.min(...ends.map((q) => Math.hypot(q[0] - cur[0], q[1] - cur[1]))) > Math.max(s.wallSpacing, s.maxBridge)) continue;
+        walks.delete(c);
+        cur = printLattice(tp, c, layer.z, s, cur, inside);
+        near = true;
+        break;
+      }
+    }
     for (const wall of buildWalls(closed, s.walls, s.wallSpacing)) {
       const pending = [...wall];
       while (pending.length) {
@@ -340,7 +362,7 @@ export function buildPlanar(tp: Toolpath, layers: Layer[], s: PrintSettings, sta
       }
     }
     // Open arcs (sections of an open shell) and supports, nearest first.
-    const openOnes = layer.contours.filter((c) => !c.closed);
+    const openOnes = layer.contours.filter((c) => !c.closed && (!c.lattice || walks.has(c)));
     while (openOnes.length) {
       let bi = 0;
       let bd = Infinity;
@@ -352,6 +374,10 @@ export function buildPlanar(tp: Toolpath, layers: Layer[], s: PrintSettings, sta
         if (d < bd) [bd, bi] = [d, k];
       });
       const c = openOnes.splice(bi, 1)[0];
+      if (c.lattice) {
+        cur = printLattice(tp, c, layer.z, s, cur, inside);
+        continue;
+      }
       let pts = densify(simplifyOpen(c.pts, s.tolerance), s.maxSegment, false);
       // A support outline is a loop written as a path: start it where the nozzle is.
       const ring = pts.length > 3 && Math.hypot(pts[0][0] - pts[pts.length - 1][0], pts[0][1] - pts[pts.length - 1][1]) < 1e-6;
@@ -379,6 +405,44 @@ export function buildPlanar(tp: Toolpath, layers: Layer[], s: PrintSettings, sta
     }
   }
   return cur;
+}
+
+/**
+ * The walk along a thin-walled network: one continuous move at the layer height. A wall the walk
+ * already passed in this layer is passed again without lifting, with the extruder off (or printed
+ * again, `latticeRetrace`). The walk starts from its end nearest to the nozzle, so on the next
+ * layer it runs back from where this one ended, right above it.
+ */
+function printLattice(tp: Toolpath, c: Contour, z: number, s: PrintSettings, cur: Vec2, inside: Inside): Vec2 {
+  let pts = c.pts;
+  const closed = Math.hypot(pts[0][0] - pts[pts.length - 1][0], pts[0][1] - pts[pts.length - 1][1]) < 1e-6;
+  if (closed) {
+    const loop = rotateToNearest(pts.slice(0, -1), cur);
+    pts = [...loop, loop[0]];
+  } else if (Math.hypot(pts[pts.length - 1][0] - cur[0], pts[pts.length - 1][1] - cur[1]) < Math.hypot(pts[0][0] - cur[0], pts[0][1] - cur[1])) pts = [...pts].reverse();
+  const last = tp.points[tp.points.length - 1];
+  const hop = last ? Math.hypot(pts[0][0] - last.x, pts[0][1] - last.y) : Infinity;
+  if (last && z > last.z && hop <= Math.max(s.wallSpacing, s.maxBridge)) {
+    // On top of where the layer below ended: straight up, then on along the walk.
+    if (hop > 1e-6) push(tp, { x: pts[0][0], y: pts[0][1], z: last.z, e: true });
+    push(tp, { x: pts[0][0], y: pts[0][1], z, e: true });
+  } else moveTo(tp, pts[0], z, s, undefined, inside, true); // on the layer below: as long as a serpentine link
+  const key = (a: Vec2, b: Vec2) => {
+    const [p, q] = a[0] < b[0] || (a[0] === b[0] && a[1] <= b[1]) ? [a, b] : [b, a];
+    return `${p[0].toFixed(3)},${p[1].toFixed(3)},${q[0].toFixed(3)},${q[1].toFixed(3)}`;
+  };
+  const done = new Set<string>();
+  let again = false;
+  for (let i = 1; i < pts.length; i++) {
+    const k = key(pts[i - 1], pts[i]);
+    const repeat = done.has(k);
+    done.add(k);
+    if (repeat && !again) tp.retraces = (tp.retraces ?? 0) + 1;
+    again = repeat;
+    const e = !repeat || s.latticeRetrace === 'print';
+    for (const q of densify([pts[i - 1], pts[i]], s.maxSegment, false).slice(1)) push(tp, { x: q[0], y: q[1], z, e });
+  }
+  return pts[pts.length - 1];
 }
 
 /** Vase mode: Z rises continuously along each contour, so there is no seam and no stop. */

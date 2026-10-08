@@ -34,6 +34,11 @@ export interface PrintSettings {
   travelLift: number; // mm, Z lift for travels with extruder off
   overhangAngle: number; // deg from vertical considered critical
   thinWallMax: number; // mm, hollow shells up to this thickness print as one mid-line (0 = off)
+  /**
+   * Thin-walled networks (honeycomb, grid): a wall the single walk must pass a second time is
+   * passed with the extruder off ('off', nothing is laid twice) or printed again ('print').
+   */
+  latticeRetrace: 'off' | 'print';
   /** 'auto': start at the front-left of the part; 'point': start at the contour point nearest (startX, startY) in BASE. */
   fillAngle: number; // deg, direction of serpentine passes in plan
   fillAlternate: boolean; // turn passes 90° on every other layer / pass
@@ -116,6 +121,7 @@ export const DEFAULT_PRINT: PrintSettings = {
   travelLift: 10,
   overhangAngle: 45,
   thinWallMax: 10,
+  latticeRetrace: 'off',
   fillAngle: 0,
   fillAlternate: true,
   fillAutoAngle: true,

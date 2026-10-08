@@ -25,13 +25,15 @@ exports[`reference part: sella.stp > planar: same path, same checks, same .src 1
     38.5,
   ],
   "outOfLimits": 0,
-  "points": 1074,
-  "printLength": 36574,
+  "points": 1078,
+  "printLength": 36365,
   "ptp": 0,
   "support": null,
-  "travels": 19,
+  "travels": 20,
   "unreachable": 0,
-  "warnings": [],
+  "warnings": [
+    "w.lattice",
+  ],
 }
 `;
 
