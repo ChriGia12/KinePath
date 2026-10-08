@@ -19,8 +19,14 @@ export interface ImportedPath {
    * a path): the object rests on the plate and the path keeps its place on it, height included.
    */
   ref?: boolean;
+  /**
+   * Index of the first point of every curve the path was made from (a Rhino file): the passes of
+   * the path are known even where the move from one to the next is printed.
+   */
+  breaks?: Uint32Array;
 }
 
+const EMPTY: number[] = [];
 const NUM = String.raw`(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)`;
 const AXIS = { x: new RegExp(String.raw`\bX\s*${NUM}`), y: new RegExp(String.raw`\bY\s*${NUM}`), z: new RegExp(String.raw`\bZ\s*${NUM}`) };
 
@@ -175,13 +181,115 @@ export function pathUnits(pts: PathPoint[]): Unit[] {
   return units;
 }
 
+/** The whole path walked backwards: same points, same printed and unprinted moves. */
+function reversed(pts: PathPoint[]): PathPoint[] {
+  const n = pts.length;
+  return pts.map((_, j) => ({ ...pts[n - 1 - j], e: j > 0 && pts[n - j].e }));
+}
+
 /**
- * The same path with every closed loop started from its point nearest to `target` (x, y in the
- * frame of the points). Open stretches are left as they are: an open line starts where it starts.
- * Returns the points and how many loops were moved, and how many stretches could not be.
+ * Some of the path lies on top of other parts of it (layers): then it can only be printed in the
+ * order it has, bottom first. A single layer over a surface has nothing under it.
  */
-export function moveSeam(pts: PathPoint[], target: [number, number]): { points: PathPoint[]; moved: number; open: number } {
+function stacked(pts: PathPoint[], bead: number): boolean {
+  const cell = Math.max(2, bead);
+  const grid = new Map<number, number[]>();
+  const key = (i: number, j: number) => (i + 32768) * 65536 + (j + 32768);
+  // Samples every ~2 mm of the printed path: position and distance along the path.
+  const [sx, sy, sz, sl]: number[][] = [[], [], [], []];
+  const along = new Float64Array(pts.length);
+  for (let i = 1; i < pts.length; i++) {
+    const [a, b] = [pts[i - 1], pts[i]];
+    const len = Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z);
+    along[i] = along[i - 1] + len;
+    if (!b.e) continue;
+    const n = Math.max(1, Math.ceil(len / 2));
+    for (let k = 0; k <= n; k++) {
+      const [x, y] = [a.x + ((b.x - a.x) * k) / n, a.y + ((b.y - a.y) * k) / n];
+      const id = key(Math.floor(x / cell), Math.floor(y / cell));
+      if (!grid.has(id)) grid.set(id, []);
+      grid.get(id)!.push(sx.length);
+      sx.push(x);
+      sy.push(y);
+      sz.push(a.z + ((b.z - a.z) * k) / n);
+      sl.push(along[i - 1] + (len * k) / n);
+    }
+  }
+  let over = 0;
+  let seen = 0;
+  const step = Math.max(1, Math.floor(pts.length / 2000));
+  for (let i = 0; i < pts.length; i += step) {
+    const p = pts[i];
+    seen++;
+    const [ci, cj] = [Math.floor(p.x / cell), Math.floor(p.y / cell)];
+    let found = false;
+    for (let a = ci - 1; a <= ci + 1 && !found; a++)
+      for (let b = cj - 1; b <= cj + 1 && !found; b++)
+        for (const q of grid.get(key(a, b)) ?? EMPTY)
+          // Lower, right underneath, and not just the same pass a little further down a slope.
+          if (p.z - sz[q] >= 0.4 && Math.hypot(p.x - sx[q], p.y - sy[q]) <= bead / 2 && Math.abs(sl[q] - along[i]) > 4 * bead) {
+            found = true;
+            break;
+          }
+    if (found) over++;
+  }
+  return over > 0.02 * seen;
+}
+
+/**
+ * A path of open passes can start from any of its ends. With the passes known (`ranges`: point
+ * ranges, in order), the four ways to walk it: as it is; every pass the other way round; and both
+ * of these backwards — the last two only when nothing of the path lies on top of the rest
+ * (`mayReorder`). The way whose first point is nearest to `target` is returned (`how` 0 = as it is).
+ */
+function openStart(pts: PathPoint[], ranges: [number, number][], target: [number, number], join: number, mayReorder: boolean): { points: PathPoint[]; how: number } {
+  const n = pts.length;
+  const d = (p: PathPoint) => Math.hypot(p.x - target[0], p.y - target[1]);
+  const whole = ranges.length > 0 && ranges[0][0] === 0 && ranges[ranges.length - 1][1] === n - 1 && ranges.every((r, k) => k === 0 || r[0] === ranges[k - 1][1] + 1);
+  // Every pass walked the other way: the move onto a pass is printed when it is as short as the
+  // printed moves between passes were (or within `join`).
+  let flipped: PathPoint[] | null = null;
+  if (whole && ranges.length > 1) {
+    let limit = join;
+    for (let k = 1; k < ranges.length; k++) {
+      const [a, b] = [pts[ranges[k][0] - 1], pts[ranges[k][0]]];
+      if (b.e) limit = Math.max(limit, Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z) + 0.01);
+    }
+    flipped = [];
+    for (const [from, to] of ranges) {
+      const last = flipped[flipped.length - 1];
+      for (let i = to; i >= from; i--) flipped.push({ ...pts[i], e: i < to });
+      const first = flipped[flipped.length - (to - from + 1)];
+      first.e = !!last && Math.hypot(first.x - last.x, first.y - last.y, first.z - last.z) <= limit;
+    }
+  }
+  const ways: (PathPoint[] | null)[] = [pts, flipped, mayReorder ? reversed(pts) : null, mayReorder && flipped ? reversed(flipped) : null];
+  let how = 0;
+  ways.forEach((w, k) => {
+    if (w && d(w[0]) < d(ways[how]![0]) - 1e-6) how = k;
+  });
+  return { points: ways[how]!, how };
+}
+
+/**
+ * The same path started from the point chosen (`target`: x, y in the frame of the points).
+ * Closed loops each start from their point nearest to it; a path of open passes starts from its
+ * end nearest to it (see openStart). Returns the points, how many loops were moved, how many
+ * stretches are open, and `ends` > 0 when an open path now starts from another end.
+ */
+export function moveSeam(
+  pts: PathPoint[],
+  target: [number, number],
+  opts: { bead?: number; join?: number; breaks?: ArrayLike<number> } = {},
+): { points: PathPoint[]; moved: number; open: number; ends: number } {
   const units = pathUnits(pts);
+  if (!units.some((u) => u.closed)) {
+    // The passes: the curves the path was drawn with, or the stretches read from it.
+    const b = opts.breaks ? Array.from(opts.breaks) : null;
+    const ranges: [number, number][] = b?.length && b[0] === 0 ? b.map((from, k) => [from, (b[k + 1] ?? pts.length) - 1]) : units.map((u) => [u.from, u.to]);
+    const r = openStart(pts, ranges, target, opts.join ?? 0, !stacked(pts, opts.bead ?? 6));
+    return { points: r.points, moved: 0, open: units.length, ends: r.how };
+  }
   const out: PathPoint[] = [];
   let at = 0;
   let moved = 0;
@@ -225,11 +333,10 @@ export function moveSeam(pts: PathPoint[], target: [number, number]): { points: 
     for (const q of ring) out.push(q);
   }
   for (; at < pts.length; at++) out.push(pts[at]);
-  return { points: out, moved, open };
+  return { points: out, moved, open, ends: 0 };
 }
 
 type V3 = [number, number, number];
-const EMPTY: number[] = [];
 
 /**
  * Tool leaning along the wall, found from the path itself: under every point lies the layer
@@ -308,7 +415,9 @@ export function tiltFromPath(tp: Toolpath, s: Pick<PrintSettings, 'maxTilt' | 'l
 export function curvesToPath(curves: ArrayLike<number>[], join = 0): ImportedPath | null {
   const xyz: number[] = [];
   const ext: number[] = [];
+  const breaks: number[] = [];
   for (const c of curves) {
+    breaks.push(xyz.length / 3);
     for (let i = 0; i + 2 < c.length; i += 3) {
       const n = xyz.length;
       const hop = n ? Math.hypot(xyz[n - 3] - c[i], xyz[n - 2] - c[i + 1], xyz[n - 1] - c[i + 2]) : Infinity;
@@ -318,5 +427,5 @@ export function curvesToPath(curves: ArrayLike<number>[], join = 0): ImportedPat
     }
   }
   if (xyz.length < 6) return null;
-  return { xyz: Float32Array.from(xyz), ext: Uint8Array.from(ext), hasExtruder: true };
+  return { xyz: Float32Array.from(xyz), ext: Uint8Array.from(ext), hasExtruder: true, breaks: Uint32Array.from(breaks.filter((b, k) => b < xyz.length / 3 && b !== breaks[k - 1])) };
 }

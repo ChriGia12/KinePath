@@ -207,6 +207,41 @@ describe('an imported path can be changed, not only copied', () => {
     expect(r.points).toEqual(spiral);
   });
 
+  it('a path of open passes (a serpentine over a surface) can start from any of its four ends', () => {
+    // 5 passes along X, 10 mm apart in Y, walked back and forth; one layer, lying on a steep slope
+    // (a pass further down the slope is lower, but it is not a layer underneath)
+    const passes = [0, 1, 2, 3, 4].map((k) => Float32Array.from((k % 2 ? [100, 0] : [0, 100]).flatMap((x) => [x, k * 10, 5 + x * 0.4])));
+    const path = curvesToPath(passes, 12)!;
+    const pts: PathPoint[] = Array.from({ length: path.xyz.length / 3 }, (_, i) => ({ x: path.xyz[i * 3], y: path.xyz[i * 3 + 1], z: path.xyz[i * 3 + 2], e: !!path.ext[i] }));
+    expect(pts.slice(1).every((p) => p.e)).toBe(true); // one continuous line
+    const start = (target: [number, number], breaks?: Uint32Array) => {
+      const r = moveSeam(pts, target, { bead: 6, join: 12, breaks });
+      // always the same passes, all printed, in one line
+      expect(printed(r.points)).toBeCloseTo(printed(pts), 6);
+      expect(r.points.slice(1).every((p) => p.e)).toBe(true);
+      return [r.points[0].x, r.points[0].y, r.ends];
+    };
+    expect(start([-5, -5], path.breaks)).toEqual([0, 0, 0]); // as drawn
+    expect(start([105, -5], path.breaks)).toEqual([100, 0, 1]); // every pass the other way
+    expect(start([105, 45], path.breaks)).toEqual([100, 40, 2]); // backwards
+    expect(start([-5, 45], path.breaks)).toEqual([0, 40, 3]); // backwards, every pass the other way
+    // without knowing the passes (one unbroken line from a .src): its two ends
+    expect(start([105, 45])).toEqual([100, 40, 2]);
+    expect(start([-5, 5])).toEqual([0, 0, 0]);
+    // the corner (100, 0) is no end of that line: it starts from the nearer of its two ends
+    expect(start([105, -5])).toEqual([100, 40, 2]);
+  });
+
+  it('a layered path of open arcs keeps its order: only the first layer can give the start', () => {
+    const arcs: PathPoint[] = [];
+    for (let k = 0; k < 4; k++) for (const x of k % 2 ? [80, 40, 0] : [0, 40, 80]) arcs.push({ x, y: 0, z: 0.5 + k * 1.5, e: arcs.length > 0 });
+    // near the other end of the first arc: every arc is walked the other way, bottom layer first
+    const r = moveSeam(arcs, [85, 0], { bead: 6, join: 8 });
+    expect([r.points[0].x, r.points[0].z, r.ends]).toEqual([80, 0.5, 1]);
+    expect(r.points.map((p) => p.z)).toEqual(arcs.map((p) => p.z));
+    expect(r.points.slice(1).every((p) => p.e)).toBe(true);
+  });
+
   it('through the whole build: the program starts where chosen and says so', () => {
     const path = parseSrc(grasshopper())!;
     const print = { ...DEFAULT_PRINT, startMode: 'point' as const, startX: 5 + 40, startY: 515 + 40 };

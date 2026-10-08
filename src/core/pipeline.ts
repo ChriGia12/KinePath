@@ -115,11 +115,12 @@ export function runBuild(
     // the plate); alone, its lowest point is laid one first-layer height above the plate.
     const dz = path.ref || (robot.placement === 'file' && !multi) ? -b.min[2] : print.firstLayerZ - low;
     for (const q of pts) q.z += dz;
-    // A start point chosen by hand: every closed loop of the path starts nearest to it.
-    const seam = start ? moveSeam(pts, start) : null;
+    // A start point chosen by hand: every closed loop starts nearest to it; a path of open passes
+    // starts from its end nearest to it.
+    const seam = start ? moveSeam(pts, start, { bead: print.wallSpacing, join: print.maxBridge, breaks: path.breaks }) : null;
     if (seam) pts = seam.points;
     const tp = importedToolpath(pts, print, path.hasExtruder);
-    if (seam) tp.warnings.push(msg(seam.moved ? 'i.seamMoved' : 'i.seamNone', { n: seam.moved, open: seam.open }));
+    if (seam) tp.warnings.push(msg(seam.moved ? 'i.seamMoved' : seam.ends ? 'i.seamEnd' : 'i.seamSame', { n: seam.moved, open: seam.open }));
     // With its object, the object tells: along the normal of the surface the bead is laid on,
     // along the wall beside a wall. Alone, the wall is read from the path, layer over layer.
     if (print.toolTilt) tp.warnings.push(path.ref ? msg('i.tiltOnObject', { n: tiltOnObject(tp, mesh, print) }) : msg('i.tiltFromPath', { n: tiltFromPath(tp, print) }));
