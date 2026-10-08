@@ -27,7 +27,7 @@ export interface PrintSettings {
    * Imported path: put its curves in printing order (lowest first, each started nearest to where
    * the one before ended) instead of taking them in the order and with the start points of the file.
    */
-  importedReorder: boolean;
+  importedExtract: boolean;
   /**
    * Removable supports under what hangs in the air (the mesh is never changed): none, printed in
    * the same program layer by layer, or in a separate program printed before the part.
@@ -123,7 +123,7 @@ export const DEFAULT_PRINT: PrintSettings = {
   adaptiveLayers: false,
   contourStrategy: 'auto',
   loopDirection: 'ccw',
-  importedReorder: false,
+  importedExtract: false,
   supports: 'none',
   baseCut: 0,
   firstLayerZ: 0.5,

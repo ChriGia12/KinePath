@@ -4,6 +4,7 @@
 import { msg } from '../i18n';
 import type { MeshData } from './mesh';
 import type { PrintSettings } from './settings';
+import { classify, type Contour, type Layer } from './slicer';
 import { assignTilt } from './tilt';
 import type { PathPoint, Toolpath } from './toolpath';
 
@@ -453,6 +454,34 @@ export function reorderPath(
   let before = 0;
   for (let i = 1; i < n; i++) if (!pts[i].e) before++;
   return { points: out, breaks: Uint32Array.from(breaks), before, after, sorted };
+}
+
+/**
+ * The curves of a path as the sections of a part: one layer per height, lowest first. null when
+ * some curve is not flat (passes over a surface are not sections).
+ */
+export function curveLayers(pts: PathPoint[], ranges: [number, number][]): Layer[] | null {
+  const flat: { z: number; c: Contour }[] = [];
+  for (const [from, to] of ranges) {
+    let [lo, hi] = [Infinity, -Infinity];
+    for (let i = from; i <= to; i++) {
+      lo = Math.min(lo, pts[i].z);
+      hi = Math.max(hi, pts[i].z);
+    }
+    if (hi - lo >= 0.05) return null;
+    const closed = to - from >= 3 && Math.hypot(pts[to].x - pts[from].x, pts[to].y - pts[from].y) < CLOSE;
+    const run = pts.slice(from, closed ? to : to + 1).map((q): [number, number] => [q.x, q.y]);
+    if (run.length >= 2) flat.push({ z: (lo + hi) / 2, c: { pts: run, closed, depth: 0 } });
+  }
+  flat.sort((a, b) => a.z - b.z);
+  const layers: Layer[] = [];
+  for (const f of flat) {
+    const last = layers[layers.length - 1];
+    if (last && f.z - last.z < 0.05) last.contours.push(f.c);
+    else layers.push({ z: f.z, contours: [f.c] });
+  }
+  for (const l of layers) classify(l.contours);
+  return layers.length ? layers : null;
 }
 
 type V3 = [number, number, number];

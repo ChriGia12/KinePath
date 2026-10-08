@@ -343,17 +343,75 @@ describe('the curves of an imported path put in printing order', () => {
     expect(r.points.map((q) => q.x)).toEqual([0, 100, 100, 0, 0, 100, 100, 0]); // back and forth
   });
 
-  it('through the build: off by default (the file as it is), on when asked, and said in the result', () => {
+  it('through the build, extracted: off by default (the curves as they are), on when asked', () => {
     const curves = [4, 3, 2, 1, 0].map((k) => square(1 + 1.5 * k, k % 4));
     const path = curvesToPath(curves, 8)!;
     const asIs = runBuild(pathProxy(path, DEFAULT_PRINT), I, DEFAULT_PRINT, DEFAULT_ROBOT, 'p.3dm', bodies, undefined, undefined, [path]);
     expect(asIs.toolpath.travels).toBe(4);
-    const print = { ...DEFAULT_PRINT, importedReorder: true };
+    const print = { ...DEFAULT_PRINT, importedExtract: true };
     const r = runBuild(pathProxy(path, print), I, print, DEFAULT_ROBOT, 'p.3dm', bodies, undefined, undefined, [path]);
     expect(r.toolpath.travels).toBe(0);
-    expect(r.toolpath.warnings.find((w) => w.k === 'i.reordered')?.p).toMatchObject({ n: 5, before: 4, after: 0 });
+    expect(r.toolpath.mode).toBe('imported');
+    expect(r.toolpath.warnings.find((w) => w.k === 'i.extractedSpiral')?.p).toMatchObject({ n: 5, layers: 5, spiral: 5, before: 4, after: 0 });
     expect(r.errors).toEqual([]);
     expect(r.collision?.count).toBe(0);
+  });
+});
+
+describe('the path extracted from curves drawn layer by layer', () => {
+  // a wall 4 mm thick drawn as two loops per layer (its outer and its inner face), 20 layers 1.5 mm
+  // apart, saved in no particular order and each loop from a different corner
+  const face = (half: number, z: number, from: number): Float32Array => {
+    const c = [[-half, -half], [half, -half], [half, half], [-half, half]];
+    return Float32Array.from(Array.from({ length: 5 }, (_, k) => c[(from + k) % 4]).flatMap(([x, y]) => [x, y, z]));
+  };
+  const curves: Float32Array[] = [];
+  for (let k = 0; k < 20; k++) curves.push(face(40, 1 + 1.5 * ((k * 7) % 20), k % 4), face(36, 1 + 1.5 * ((k * 7) % 20), (k + 2) % 4));
+  const path = curvesToPath(curves, 8)!;
+  const print = { ...DEFAULT_PRINT, importedExtract: true };
+  const r = runBuild(pathProxy(path, print), I, print, { ...DEFAULT_ROBOT, originX: 0, originY: 500 }, 'p.3dm', bodies, undefined, undefined, [path]);
+  const pts = r.toolpath.points;
+
+  it('one loop per layer along the middle of the wall, not its two faces', () => {
+    expect(r.toolpath.layerCount).toBe(20);
+    expect(r.toolpath.warnings.find((w) => w.k === 'i.extractedSpiral')?.p).toMatchObject({ n: 40, layers: 20, merged: 20, spiral: 20 });
+    // every point is 38 mm from the centre along X or Y: half-way between the faces at 36 and 40
+    for (const p of pts) expect(Math.abs(Math.max(Math.abs(p.x), Math.abs(p.y)) - 38)).toBeLessThan(0.05);
+    // half the length the two faces would take (plus the closing lap on the rim)
+    expect(r.toolpath.printLength).toBeLessThan(21.5 * 8 * 38);
+  });
+
+  it('one thread climbing from layer to layer: the extruder never stops, the path never goes down', () => {
+    expect(r.toolpath.travels).toBe(0);
+    expect(pts.slice(1).every((p) => p.e)).toBe(true);
+    for (let i = 1; i < pts.length; i++) expect(pts[i].z).toBeGreaterThanOrEqual(pts[i - 1].z - 1e-9);
+    // a flat first layer, then 1.5 mm up for every turn
+    expect(pts[0].z).toBeCloseTo(DEFAULT_PRINT.firstLayerZ, 6);
+    expect(pts[pts.length - 1].z).toBeCloseTo(DEFAULT_PRINT.firstLayerZ + 19 * 1.5, 6);
+    const turn = r.toolpath.layerStart;
+    for (let k = 2; k < turn.length; k++) expect(pts[turn[k]].z - pts[turn[k - 1]].z).toBeCloseTo(1.5, 6);
+    expect(r.errors).toEqual([]);
+    expect(r.collision?.count).toBe(0);
+  });
+
+  it('with flat layers asked for, the layers are flat and joined by the ramp', () => {
+    const flat = { ...print, contourStrategy: 'layers' as const };
+    const f = runBuild(pathProxy(path, flat), I, flat, { ...DEFAULT_ROBOT, originX: 0, originY: 500 }, 'p.3dm', bodies, undefined, undefined, [path]);
+    expect(f.toolpath.warnings.map((w) => w.k)).toContain('i.extracted');
+    expect(f.toolpath.travels).toBe(0);
+    // 20 flat layers; from one to the next the bead climbs 1.5 mm along the ramp (20 mm), still printing
+    const fp = f.toolpath.points;
+    expect(new Set(fp.map((p) => +p.z.toFixed(3))).size).toBe(20);
+    const ramps = fp.filter((p, i) => i > 0 && p.e && Math.abs(p.z - fp[i - 1].z - 1.5) < 1e-6 && Math.abs(Math.hypot(p.x - fp[i - 1].x, p.y - fp[i - 1].y) - DEFAULT_PRINT.layerRamp) < 1e-6);
+    expect(ramps.length).toBe(19);
+  });
+
+  it('a loop far below the rest is not joined to it by a bead in the air', () => {
+    const low = curvesToPath([face(40, 1, 0), face(36, 1, 0), ...[0, 1, 2, 3].flatMap((k) => [face(40, 10 + 1.5 * k, 0), face(36, 10 + 1.5 * k, 0)])], 8)!;
+    const g = runBuild(pathProxy(low, print), I, print, { ...DEFAULT_ROBOT, originX: 0, originY: 500 }, 'p.3dm', bodies, undefined, undefined, [low]);
+    const up = g.toolpath.points.findIndex((p) => p.z > 5);
+    expect(g.toolpath.points[up].e).toBe(false);
+    expect(g.toolpath.travels).toBe(1);
   });
 });
 

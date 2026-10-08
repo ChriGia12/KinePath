@@ -76,6 +76,10 @@
             <button class="ghost small" data-scale="25.4" title="File in pollici" data-i18n-title="scale.in">×25,4</button>
             <button class="ghost small" data-scale="1" title="Dimensioni del file" data-i18n-title="scale.one">1:1</button>
           </div>
+          <div class="extract-row" id="extractRow" hidden>
+            <button class="primary small" id="extractBtn" data-i18n="path.extract">Estrai percorso corretto</button>
+            <span class="hint" data-i18n="path.extractHint">Dalle curve del file ricava il percorso da stampare: un giro solo per strato (al centro di una parete disegnata con due curve), dal basso verso l'alto, a spirale dove si può.</span>
+          </div>
           <div class="project-row" id="projectRow">
             <button class="ghost small" id="openProject" data-i18n="project.open">Apri progetto</button>
             <button class="ghost small" id="saveProject" data-i18n="project.save" disabled>Salva progetto</button>
@@ -212,7 +216,6 @@
           </label>
           <button class="ghost small" id="placeBtn" title="Clicca poi sul piano" data-i18n="vp.place" data-i18n-title="vp.place.title">Posiziona pezzo</button>
           <button class="ghost small" id="startBtn" title="Clicca poi vicino al contorno" data-i18n="vp.start" data-i18n-title="vp.start.title">Punto iniziale</button>
-          <button class="ghost small" id="reorderBtn" title="Percorso importato: curve dal basso verso l'alto, ognuna fatta partire vicino a dove finisce la precedente" data-i18n="vp.reorder" data-i18n-title="vp.reorder.title" hidden>Riordina percorso</button>
           <button class="ghost small" id="fitBtn" data-i18n="vp.fit">Inquadra</button>
           <span id="pickHint" class="pick-hint" hidden></span>
           <div class="legend"><span class="sw grad"></span><span data-i18n="vp.legend.print">stampa (basso → alto)</span> <span class="sw travel"></span><span data-i18n="vp.legend.travel">spostamento senza estrusione</span> <span class="sw support"></span><span data-i18n="vp.legend.support">supporto</span></div>

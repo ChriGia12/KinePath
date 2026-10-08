@@ -515,11 +515,13 @@ function printLattice(tp: Toolpath, c: Contour, z: number, s: PrintSettings, cur
 }
 
 /** Vase mode: Z rises continuously along each contour, so there is no seam and no stop. */
-function buildSpiral(tp: Toolpath, layers: Layer[], s: PrintSettings, start: Vec2): Vec2 {
+function buildSpiral(tp: Toolpath, layers: Layer[], s: PrintSettings, start: Vec2, ownHeights = false): Vec2 {
   let cur: Vec2 = start;
-  const h = s.layerHeight;
   let below: Contour[] = [];
   layers.forEach((layer, li) => {
+    // The climb of a turn: the layer height, or (layers given with their own heights) the step
+    // from the layer below.
+    const h = ownHeights && li > 0 ? layer.z - layers[li - 1].z : s.layerHeight;
     tp.layerStart.push(tp.points.length);
     const loop = prepareLoop(layer.contours[0], s, cur);
     const ring = [...loop, loop[0]];
@@ -545,6 +547,53 @@ function buildSpiral(tp: Toolpath, layers: Layer[], s: PrintSettings, start: Vec
     cur = loop[0];
   });
   return cur;
+}
+
+/**
+ * A path built from flat curves drawn elsewhere, read as the sections of a part (`layers`: one
+ * per height, lowest first, heights as drawn). What the site does with its own sections is done
+ * with these: a wall drawn as two loops one inside the other becomes one loop along its middle
+ * (thin walls and networks, up to `thinWallMax`); loops start one above the other, all the same
+ * way round; and where every layer is a single loop the path is one spiral climbing from layer to
+ * layer (unless flat layers are asked for, then with the ramp). A gap in height larger than the
+ * usual step between layers starts a new run. Returns the path, how many layers had loops merged
+ * into a mid-line, and how many layers are printed as a spiral.
+ */
+export function buildFromCurves(layers: Layer[], s: PrintSettings, start: Vec2): { tp: Toolpath; merged: number; spiral: number } {
+  const tp: Toolpath = { points: [], mode: 'imported', layerCount: layers.length, layerHeight: s.layerHeight, layerStart: [], printLength: 0, travelLength: 0, travels: 0, warnings: [] };
+  let merged = 0;
+  const made = layers.map((l) => {
+    const contours = collapseLattices(collapseThinWalls(l.contours, s.thinWallMax), s.thinWallMax);
+    if (contours.length < l.contours.length || contours.some((c) => c.lattice)) merged++;
+    return { z: l.z, contours };
+  });
+  // Runs of layers evenly spaced: a larger gap in height is not a layer change.
+  const steps = made.slice(1).map((l, k) => l.z - made[k].z).sort((a, b) => a - b);
+  const usual = steps.length ? steps[Math.floor(steps.length / 2)] : 0;
+  const runs: Layer[][] = [];
+  made.forEach((l, k) => {
+    if (k > 0 && l.z - made[k - 1].z <= 1.5 * usual + 0.01) runs[runs.length - 1].push(l);
+    else runs.push([l]);
+  });
+  let cur = start;
+  let spiral = 0;
+  for (const run of runs) {
+    const first = tp.points.length;
+    if (s.contourStrategy !== 'layers' && s.walls === 1 && run.length > 1 && run.every(isSingleLoop)) {
+      cur = buildSpiral(tp, run, s, cur, true);
+      spiral += run.length;
+    } else cur = buildPlanar(tp, run, s, cur);
+    // Up to a run that starts higher than a layer above: never with the extruder on (a bead in the air).
+    const [a, b] = [tp.points[first - 1], tp.points[first]];
+    if (a && b?.e) {
+      const d = Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z);
+      b.e = false;
+      tp.printLength -= d;
+      tp.travelLength += d;
+      tp.travels++;
+    }
+  }
+  return { tp, merged, spiral };
 }
 
 /** Pass direction of layer i: the chosen angle, turned 90° on every other layer if alternating. */

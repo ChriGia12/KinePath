@@ -5,14 +5,14 @@ import { supportProgramName, writeKukaSrc } from './kuka';
 import { applyMatrix, computeBounds, cutBelow, dropToOrigin, mergeMeshes, mulMat3, openEdgeLift, rotZ, translate, type Mat3, type MeshData } from './mesh';
 import type { PrintSettings, RobotSettings } from './settings';
 import { reachReport, type ReachReport } from './robot';
-import { buildPlanar, buildToolpath, sliceForPrint, spiralRange, type PathPoint, type Toolpath } from './toolpath';
+import { buildFromCurves, buildPlanar, buildToolpath, sliceForPrint, spiralRange, type PathPoint, type Toolpath } from './toolpath';
 import { riskZones, type Zones } from './zones';
 import { boxesOverlap, joinInTurn, printPartsInTurn, splitByBoxes, type PartBox } from './parts';
 import { tiltAlongWalls, tiltOnObject } from './tilt';
 import { evaluateOrientation, OVERHANG_LIMIT, supportOk } from './orientation';
 import { collisionReport, type Body, type CollisionReport } from './collision';
 import { applyEdits, pathSignature, type PathEdits } from './edits';
-import { importedToolpath, moveSeam, pathUnits, reorderPath, tiltFromPath, type ImportedPath } from './imported';
+import { curveLayers, importedToolpath, moveSeam, pathUnits, reorderPath, tiltFromPath, type ImportedPath } from './imported';
 import { resolveStrategy } from './strategy';
 
 export interface BuildResult {
@@ -115,18 +115,23 @@ export function runBuild(
     // the plate); alone, its lowest point is laid one first-layer height above the plate.
     const dz = path.ref || (robot.placement === 'file' && !multi) ? -b.min[2] : print.firstLayerZ - low;
     for (const q of pts) q.z += dz;
-    // Asked to put the curves in printing order: lowest first, each started nearest to where the
-    // one before ended (the first one nearest to the start point, when chosen).
+    // The curves of the path: those it was drawn with, or the stretches read from it.
     const firsts = path.breaks ? Array.from(path.breaks) : null;
     const ranges: [number, number][] = firsts?.length && firsts[0] === 0 ? firsts.map((from, k) => [from, (firsts[k + 1] ?? pts.length) - 1]) : pathUnits(pts).map((u) => [u.from, u.to]);
-    const order = print.importedReorder ? reorderPath(pts, ranges, { join: print.maxBridge, target: start, direction: print.loopDirection }) : null;
+    // Asked to extract the path: flat curves are read as the sections of a part and the path is
+    // built from them as the site builds its own (one loop along the middle of a double wall, a
+    // spiral where every layer is one loop). Curves that are not flat are only put in order.
+    const sections = print.importedExtract ? curveLayers(pts, ranges) : null;
+    const built = sections ? buildFromCurves(sections, print, start ?? [pts[ranges[0][0]].x, pts[ranges[0][0]].y]) : null;
+    const order = print.importedExtract && !built ? reorderPath(pts, ranges, { join: print.maxBridge, target: start, direction: print.loopDirection }) : null;
     if (order) pts = order.points;
     // A start point chosen by hand: every closed loop starts nearest to it; a path of open passes
     // starts from its end nearest to it.
-    const seam = start && !order ? moveSeam(pts, start, { bead: print.wallSpacing, join: print.maxBridge, breaks: path.breaks }) : null;
+    const seam = start && !order && !built ? moveSeam(pts, start, { bead: print.wallSpacing, join: print.maxBridge, breaks: path.breaks }) : null;
     if (seam) pts = seam.points;
-    const tp = importedToolpath(pts, print, path.hasExtruder);
-    if (print.importedReorder) tp.warnings.push(order ? msg(order.sorted ? 'i.reordered' : 'i.reorderedKept', { n: ranges.length, before: order.before, after: order.after }) : msg('i.reorderNo'));
+    const tp = built ? built.tp : importedToolpath(pts, print, path.hasExtruder);
+    if (built) tp.warnings.push(msg(built.spiral ? 'i.extractedSpiral' : 'i.extracted', { n: ranges.length, layers: sections!.length, merged: built.merged, spiral: built.spiral, before: pts.filter((q, i) => i > 0 && !q.e).length, after: tp.travels }));
+    else if (print.importedExtract) tp.warnings.push(order ? msg(order.sorted ? 'i.reordered' : 'i.reorderedKept', { n: ranges.length, before: order.before, after: order.after }) : msg('i.reorderNo'));
     if (seam) tp.warnings.push(msg(seam.moved ? 'i.seamMoved' : seam.ends ? 'i.seamEnd' : 'i.seamSame', { n: seam.moved, open: seam.open }));
     // With its object, the object tells: along the normal of the surface the bead is laid on,
     // along the wall beside a wall. Alone, the wall is read from the path, layer over layer.

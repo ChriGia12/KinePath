@@ -477,33 +477,41 @@ test('a Rhino file with the path and its object: the object is only a reference,
   expect(Math.max(...z)).toBe(44);
 });
 
-test('the curves of an imported path can be put in printing order with one button', async ({ page }) => {
+test('«Estrai percorso corretto»: from the curves of the file, one loop per layer climbing as a spiral', async ({ page }) => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const rhino = (await ((await import('rhino3dm')).default as any)()) as any;
   const doc = new rhino.File3dm();
-  // six square loops saved from the top down, each written from a different corner
-  const corners = [[0, 0], [80, 0], [80, 80], [0, 80]];
-  for (let k = 5; k >= 0; k--) {
-    const pl = new rhino.Polyline();
-    for (let i = 0; i <= 4; i++) pl.add(1400 + corners[(k + i) % 4][0], -500 + corners[(k + i) % 4][1], 45 + 1.5 * k);
-    doc.objects().addCurve(pl.toPolylineCurve(), null);
-  }
-  await page.setInputFiles('#file', { name: 'disordinato.3dm', mimeType: 'application/octet-stream', buffer: Buffer.from(doc.toByteArray()) });
+  // a wall drawn as two loops per layer (outer and inner face, 4 mm apart), six layers saved from
+  // the top down, every loop written from a different corner
+  for (let k = 5; k >= 0; k--)
+    for (const half of [40, 36]) {
+      const c = [[-half, -half], [half, -half], [half, half], [-half, half]];
+      const pl = new rhino.Polyline();
+      for (let i = 0; i <= 4; i++) pl.add(1450 + c[(k + i) % 4][0], -450 + c[(k + i) % 4][1], 45 + 1.5 * k);
+      doc.objects().addCurve(pl.toPolylineCurve(), null);
+    }
+  await page.setInputFiles('#file', { name: 'parete doppia.3dm', mimeType: 'application/octet-stream', buffer: Buffer.from(doc.toByteArray()) });
   await expect(download(page)).toBeEnabled({ timeout: 30_000 });
-  // as saved: the nozzle jumps onto every loop
-  await expect(stat(page, 'Modo scelto')).toContainText('5 spostamenti con estrusore spento');
-  await expect(page.locator('#reorderBtn')).toBeVisible();
-  await page.locator('#reorderBtn').click();
-  await expect(page.locator('#warnings')).toContainText('Percorso riordinato: 6 curve dal basso verso l’alto');
-  await expect(page.locator('#warnings')).toContainText('Spostamenti a estrusore spento: 0 (nell’ordine del file erano 5)');
+  // as saved: twelve loops, a jump onto most of them
+  await expect(stat(page, 'Modo scelto')).toContainText('spostamenti con estrusore spento');
+  const button = page.locator('#extractBtn');
+  await expect(button).toBeVisible();
+  await expect(button).toHaveText('Estrai percorso corretto');
+  await button.click();
+  await expect(page.locator('#warnings')).toContainText('Percorso estratto dalle 12 curve del file: 6 strati');
+  await expect(page.locator('#warnings')).toContainText('6 strati sono un’unica spirale');
   await expect(stat(page, 'Modo scelto')).toContainText('Estrusore mai fermo');
   await expect(download(page)).toBeEnabled();
   const [dl] = await Promise.all([page.waitForEvent('download'), download(page).click()]);
-  const z = readFileSync((await dl.path())!, 'utf8').split('\r\n').filter((l) => l.startsWith('LIN {')).map((l) => parseFloat(/Z (-?[\d.]+)/.exec(l)![1]));
-  expect(z).toEqual([...z].sort((a, b) => a - b)); // bottom first, never down again
-  // the same setting as the field in «Stampa»; pressed again, the file is taken as it is
-  await expect(page.locator('#printFields label').filter({ hasText: 'Riordina le curve' }).locator('input')).toBeChecked();
-  await page.locator('#reorderBtn').click();
-  await expect(stat(page, 'Modo scelto')).toContainText('5 spostamenti con estrusore spento');
+  const lins = readFileSync((await dl.path())!, 'utf8').split('\r\n').filter((l) => l.startsWith('LIN {'));
+  const num = (l: string, a: string) => parseFloat(new RegExp(`${a} (-?[\\d.]+)`).exec(l)![1]);
+  const z = lins.map((l) => num(l, 'Z'));
+  expect(z).toEqual([...z].sort((a, b) => a - b)); // climbing all the way, never down
+  // along the middle of the wall: 38 mm from the centre (X 5, Y 515), not 36 or 40
+  for (const l of lins) expect(Math.abs(Math.max(Math.abs(num(l, 'X') - 5), Math.abs(num(l, 'Y') - 515)) - 38)).toBeLessThan(0.05);
+  // pressed again, the curves of the file are back
+  await expect(button).toHaveText('Torna alle curve del file');
+  await button.click();
+  await expect(stat(page, 'Modo scelto')).toContainText('spostamenti con estrusore spento');
 });
 

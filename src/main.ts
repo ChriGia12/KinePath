@@ -372,6 +372,7 @@ function selectPart(i: number) {
   }
   renderScale();
   renderSplit();
+  renderExtract();
 }
 
 // ---------- cut in two pieces ----------
@@ -1100,8 +1101,6 @@ const PRINT_FIELDS: Field[] = [
   { key: 'surfacePasses', label: 'f.surfacePasses', kind: 'number', step: 1, min: 1 },
   { key: 'surfaceMaxSlope', label: 'f.surfaceMaxSlope', kind: 'number', step: 5, min: 1 },
   { key: 'surfaceTilt', label: 'f.surfaceTilt', kind: 'check', full: true },
-  { group: 'g.imported' },
-  { key: 'importedReorder', label: 'f.importedReorder', kind: 'check', full: true },
   { group: 'g.start' },
   {
     key: 'startMode',
@@ -1419,7 +1418,7 @@ async function build(): Promise<BuildMsg | null> {
   lastBuild = r;
   if (r.editsDropped) pathEdits = null; // the path changed: the changes made by hand are gone (said in the result)
   renderEdits();
-  renderReorder();
+  renderExtract();
   viewer.setModel(r.mesh, r.offset, parseFloat($<HTMLInputElement>('opacity').value));
   viewer.setBed(robot.bedSizeX, robot.bedSizeY, [robot.bedCenterX, robot.bedCenterY, robot.bedTopZ]);
   viewer.setToolpath(r.xyz, r.ext, r.meta.layerStart, r.offset, r.sup);
@@ -1659,17 +1658,19 @@ $('editClear').onclick = () => {
   void build();
 };
 
-// Imported path: put its curves in printing order (same setting as the field in «Stampa»).
-$('reorderBtn').onclick = () => {
-  print.importedReorder = !print.importedReorder;
+// Imported path: build the path to print from its curves (one loop per layer along the middle
+// of a double wall, a spiral where it can be) instead of taking the curves as they are.
+$('extractBtn').onclick = () => {
+  print.importedExtract = !print.importedExtract;
   save('gb.print', print);
-  renderPrintFields();
+  renderExtract();
   buildSoon();
 };
-/** The button is there only with an imported path, and shows whether the reordering is on. */
-function renderReorder() {
-  $('reorderBtn').hidden = !parts.some((p) => p.path);
-  $('reorderBtn').classList.toggle('active', print.importedReorder);
+/** The button is under the model, only for an imported path; pressed again it gives the file back. */
+function renderExtract() {
+  $('extractRow').hidden = !cur()?.path;
+  $('extractBtn').textContent = t(print.importedExtract ? 'path.extractUndo' : 'path.extract');
+  $('extractBtn').classList.toggle('active', print.importedExtract);
 }
 
 // ---------- fixed robot cell ----------
