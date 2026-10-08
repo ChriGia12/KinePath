@@ -268,3 +268,11 @@ details[open] .card h2 .chosen, details[open] summary .chosen { display: none; }
 .warnings li.blocked { background: color-mix(in srgb, var(--danger) 15%, transparent); color: var(--danger); font-weight: 600; }
 
 .field input.invalid { border-color: var(--danger); outline: 2px solid color-mix(in srgb, var(--danger) 40%, transparent); }
+
+.edit { flex: 1 1 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.edit-panel { flex: 1 1 100%; display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; color: var(--muted); }
+.edit-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.edit-row input { width: 72px; font: inherit; font-size: 12.5px; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px; }
+.edit-row input.invalid { border-color: var(--danger); }
+.edit-row .hint { margin: 0; font-size: 12px; flex: 1 1 260px; }
+

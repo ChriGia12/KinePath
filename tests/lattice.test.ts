@@ -108,8 +108,34 @@ describe('a honeycomb is printed in one go', () => {
     expect(tp.warnings.map((w) => w.k)).not.toContain('w.openLayers');
   });
 
-  it('no wall is laid twice: the second pass over a wall has the extruder off', () => {
+  it('the walls passed twice are laid as two beads side by side: the extruder never stops', () => {
     const tp = buildToolpath(mesh, s);
+    expect(tp.travels).toBe(0);
+    expect(tp.points.slice(1).every((p) => p.e)).toBe(true);
+    expect(tp.retraces).toBeGreaterThan(0);
+    // every point is on a mid-line or half a bead beside it — never anywhere else
+    const beside = tp.points.filter((p) => Math.abs(distToLoops([p.x, p.y], loops) - T / 2) > 0.7);
+    expect(beside.length).toBeGreaterThan(0);
+    for (const p of beside) {
+      const d = distToLoops([p.x, p.y], loops);
+      // half a bead from the mid-line: on a face of the wall (0), or further at a mitred corner
+      expect(d).toBeLessThan(T / 2 + 0.7);
+    }
+    // a long move is a wall: it runs along the mid-line or beside it, never askew across it
+    for (let i = 1; i < tp.points.length; i++) {
+      const [a, b] = [tp.points[i - 1], tp.points[i]];
+      if (a.z !== b.z || Math.hypot(b.x - a.x, b.y - a.y) < 10) continue;
+      expect(Math.abs(distToLoops([a.x, a.y], loops) - distToLoops([b.x, b.y], loops))).toBeLessThan(0.8);
+    }
+    // no bead on top of another: no two printed segments of a layer run along the same line
+    const z = tp.points[tp.points.length - 1].z;
+    const segs = tp.points.map((p, i) => [tp.points[i - 1], p]).filter(([a, b]) => a && b.e && a.z === z && b.z === z);
+    const mid = segs.map(([a, b]) => [(a.x + b.x) / 2, (a.y + b.y) / 2, Math.hypot(b.x - a.x, b.y - a.y)]).filter((m) => m[2] > 10);
+    for (let i = 0; i < mid.length; i++) for (let j = i + 1; j < mid.length; j++) expect(Math.hypot(mid[i][0] - mid[j][0], mid[i][1] - mid[j][1])).toBeGreaterThan(T * 0.8);
+  });
+
+  it('or, if chosen, the second pass over a wall has the extruder off: no wall is laid twice', () => {
+    const tp = buildToolpath(mesh, { ...s, latticeRetrace: 'off' });
     const walls = centerlineGraph(loops).edges.reduce((a, e) => a + length(e.pts), 0);
     // printed length per layer = the walls once (plus the 1.5 mm steps between layers)
     expect(tp.printLength / 4).toBeGreaterThan(walls - 1);
@@ -121,7 +147,7 @@ describe('a honeycomb is printed in one go', () => {
   });
 
   it('every printed point is in the middle of a wall', () => {
-    const tp = buildToolpath(mesh, s);
+    const tp = buildToolpath(mesh, { ...s, latticeRetrace: 'off' });
     for (const p of tp.points) expect(Math.abs(distToLoops([p.x, p.y], loops) - T / 2)).toBeLessThan(0.7);
   });
 });

@@ -15,6 +15,7 @@ import { cutPiece, type SplitPlan } from './core/split';
 import { Viewer } from './viewer';
 import { applyStatic, getLang, locale, msg, MsgError, setLang, t, tm, type Msg } from './i18n';
 import type { WorkerRequest } from './worker';
+import type { PathEdit, PathEdits } from './core/edits';
 
 // ---------- state ----------
 
@@ -37,6 +38,21 @@ const save = (key: string, v: unknown) => {
 const print: PrintSettings = load('gb.print', DEFAULT_PRINT);
 if ((print.mode as string) === 'auto') print.mode = 'planar'; // old saved setting
 if (typeof print.supports === 'boolean') print.supports = print.supports ? 'inline' : 'none'; // old on/off setting
+/** Settings saved before "contour" became one print type: spiral and rings are now its strategies. */
+function normalizePrint() {
+  if ((print.mode as string) === 'spiral') Object.assign(print, { mode: 'planar', contourStrategy: 'spiral' });
+  if (print.adaptiveLayers) Object.assign(print, { adaptiveLayers: false, contourStrategy: 'rings' });
+}
+normalizePrint();
+// Walls of a network passed twice are laid side by side: an older saved choice no longer applies.
+try {
+  if (localStorage.getItem('gb.latticeSide') !== '1') {
+    print.latticeRetrace = 'side';
+    localStorage.setItem('gb.latticeSide', '1');
+  }
+} catch {
+  /* storage unavailable */
+}
 // The whole mesh is printed: an old saved minimum contour length (10 mm) no longer applies.
 try {
   if (localStorage.getItem('gb.meshWhole') !== '1') {
@@ -395,8 +411,10 @@ async function cutPart(
   }).filter((q) => q.mesh.indices.length > 0);
   if (pieces.length < 2) return;
   parts.splice(idx, 1, ...pieces);
-  if (mode && print.mode !== mode) {
-    print.mode = mode;
+  // The pieces were checked as a contour print: as a spiral when both allow it.
+  const strategy = mode === 'spiral' ? 'spiral' : print.contourStrategy === 'spiral' ? 'auto' : print.contourStrategy;
+  if (mode && (print.mode !== 'planar' || print.contourStrategy !== strategy)) {
+    Object.assign(print, { mode: 'planar', contourStrategy: strategy });
     save('gb.print', print);
     renderPrintFields();
   }
@@ -861,6 +879,7 @@ async function openProject(f: File) {
   }
   clearParts();
   Object.assign(print, structuredClone(DEFAULT_PRINT), data.print);
+  normalizePrint();
   Object.assign(robot, structuredClone(DEFAULT_ROBOT), data.robot);
   for (const k of CELL_KEYS) (robot as unknown as Record<string, unknown>)[k] = structuredClone(DEFAULT_ROBOT[k]);
   Object.assign(robot, FIXED_ROBOT);
@@ -923,14 +942,33 @@ const PRINT_FIELDS: Field[] = [
     full: true,
     options: [
       ['planar', 'mode.planar'],
-      ['spiral', 'mode.spiral'],
       ['zigzag', 'mode.zigzag'],
       ['surface', 'mode.surface'],
     ],
   },
+  {
+    key: 'contourStrategy',
+    label: 'f.contourStrategy',
+    kind: 'select',
+    full: true,
+    options: [
+      ['auto', 'cs.auto'],
+      ['layers', 'cs.layers'],
+      ['spiral', 'cs.spiral'],
+      ['rings', 'cs.rings'],
+    ],
+  },
   { key: 'layerHeight', label: 'f.layerHeight', kind: 'number', step: 0.1, min: 0.1 },
   { key: 'layerRamp', label: 'f.layerRamp', kind: 'number', step: 5, min: 0 },
-  { key: 'adaptiveLayers', label: 'f.adaptiveLayers', kind: 'check', full: true },
+  {
+    key: 'loopDirection',
+    label: 'f.loopDirection',
+    kind: 'select',
+    options: [
+      ['ccw', 'dir.ccw'],
+      ['cw', 'dir.cw'],
+    ],
+  },
   { key: 'toolTilt', label: 'f.toolTilt', kind: 'check', full: true },
   { key: 'maxTilt', label: 'f.maxTilt', kind: 'number', step: 5, min: 0 },
   {
@@ -960,6 +998,7 @@ const PRINT_FIELDS: Field[] = [
     kind: 'select',
     full: true,
     options: [
+      ['side', 'lattice.side'],
       ['off', 'lattice.off'],
       ['print', 'lattice.print'],
     ],
@@ -1191,6 +1230,9 @@ interface BuildMsg {
   support: { islands: number; overhang: number } | null;
   zones: Zones;
   collision: CollisionReport | null;
+  baseSig: string;
+  edited: number;
+  editsDropped: boolean;
 }
 
 /**
@@ -1238,7 +1280,7 @@ async function build(): Promise<BuildMsg | null> {
   let r: BuildMsg;
   try {
     r = await busy(t('busy.path'), () =>
-      run<BuildMsg>('build', { type: 'build', mesh: job.mesh, matrix: job.matrix, print: { ...print }, robot: job.robot, sourceName: job.name, bodies, partBoxes: job.boxes }),
+      run<BuildMsg>('build', { type: 'build', mesh: job.mesh, matrix: job.matrix, print: { ...print }, robot: job.robot, sourceName: job.name, bodies, partBoxes: job.boxes, edits: pathEdits ?? undefined }),
     );
   } catch (e) {
     if (!(e instanceof Superseded) && seq === buildSeq) $('warnings').replaceChildren(li(tm(errText(e))));
@@ -1249,6 +1291,8 @@ async function build(): Promise<BuildMsg | null> {
   lastSrc = r.src;
   currentMeta = r.meta;
   lastBuild = r;
+  if (r.editsDropped) pathEdits = null; // the path changed: the changes made by hand are gone (said in the result)
+  renderEdits();
   viewer.setModel(r.mesh, r.offset, parseFloat($<HTMLInputElement>('opacity').value));
   viewer.setBed(robot.bedSizeX, robot.bedSizeY, [robot.bedCenterX, robot.bedCenterY, robot.bedTopZ]);
   viewer.setToolpath(r.xyz, r.ext, r.meta.layerStart, r.offset, r.sup);
@@ -1429,6 +1473,65 @@ $<HTMLInputElement>('opacity').addEventListener('input', (e) => viewer.setModelO
 $('fitBtn').onclick = () => viewer.fit();
 $<HTMLInputElement>('zonesToggle').addEventListener('change', (e) => viewer.setZonesVisible((e.target as HTMLInputElement).checked));
 
+// ---------- changes made by hand to the path ----------
+
+/** Edits of the path shown now; they go with every build and are dropped when the path changes. */
+let pathEdits: PathEdits | null = null;
+
+function renderEdits() {
+  const n = pathEdits?.edits.length ?? 0;
+  $('editCount').textContent = n ? t('edit.count', { n }) : '';
+  $<HTMLButtonElement>('editUndo').disabled = !n;
+  $<HTMLButtonElement>('editClear').disabled = !n;
+}
+
+/** Adds an edit on the stretch written in the two fields (LIN numbers as shown, from 1). */
+function addEdit(make: (from: number, to: number) => PathEdit | null) {
+  if (!lastBuild) return;
+  const n = lastBuild.xyz.length / 3;
+  const fields = [$<HTMLInputElement>('editFrom'), $<HTMLInputElement>('editTo')];
+  const [a, b] = fields.map((f) => parseInt(f.value, 10) - 1);
+  const ok = [a, b].map((v) => Number.isInteger(v) && v >= 0 && v < n);
+  fields.forEach((f, i) => f.classList.toggle('invalid', !ok[i]));
+  if (!ok[0] || !ok[1]) return;
+  const ed = make(Math.min(a, b), Math.max(a, b));
+  if (!ed) return;
+  if (!pathEdits || pathEdits.sig !== lastBuild.baseSig) pathEdits = { sig: lastBuild.baseSig, edits: [] };
+  pathEdits.edits.push(ed);
+  void build();
+}
+
+$('editToggle').onclick = () => {
+  const panel = $('editPanel');
+  panel.hidden = !panel.hidden;
+  $('editToggle').classList.toggle('active', !panel.hidden);
+  if (!panel.hidden && !$<HTMLInputElement>('editFrom').value) {
+    $<HTMLInputElement>('editFrom').value = String(simIndex + 1);
+    $<HTMLInputElement>('editTo').value = String(simIndex + 1);
+  }
+};
+$('editFromHere').onclick = () => ($<HTMLInputElement>('editFrom').value = String(simIndex + 1));
+$('editToHere').onclick = () => ($<HTMLInputElement>('editTo').value = String(simIndex + 1));
+$('editOff').onclick = () => addEdit((from, to) => ({ op: 'extruder', from, to, on: false }));
+$('editOn').onclick = () => addEdit((from, to) => ({ op: 'extruder', from, to, on: true }));
+$('editDelete').onclick = () => addEdit((from, to) => ({ op: 'delete', from, to }));
+$('editShift').onclick = () =>
+  addEdit((from, to) => {
+    const d = ['editDx', 'editDy', 'editDz'].map((id) => parseFloat($<HTMLInputElement>(id).value.replace(',', '.')) || 0);
+    return d.some((v) => v !== 0) ? { op: 'shift', from, to, dx: d[0], dy: d[1], dz: d[2] } : null;
+  });
+$('editUndo').onclick = () => {
+  if (!pathEdits?.edits.length) return;
+  pathEdits.edits.pop();
+  if (!pathEdits.edits.length) pathEdits = null;
+  void build();
+};
+$('editClear').onclick = () => {
+  if (!pathEdits) return;
+  pathEdits = null;
+  void build();
+};
+
 // ---------- fixed robot cell ----------
 
 let robotPose: Joints = [...robot.safeAxes] as Joints;
@@ -1542,7 +1645,7 @@ function statsItems(r: BuildMsg): [string, string, boolean?][] {
   const tp = r.meta;
   const seconds = (tp.printLength + tp.travelLength) / (robot.velCP * 1000) + tp.travels * robot.extruderDelay;
   const kb = new Blob([r.src]).size / 1024;
-  const stops = ' ' + (tp.travels ? t('r.stops', { n: tp.travels }) : tp.retraces && print.latticeRetrace !== 'print' ? t('r.noJumps') : t('r.noStops')) + (tp.partChanges ? ' ' + t('r.partChanges', { n: tp.partChanges }) : '') + (tp.retraces ? ' ' + t(print.latticeRetrace === 'print' ? 'r.retracesPrint' : 'r.retraces', { n: tp.retraces }) : '');
+  const stops = ' ' + (tp.travels ? t('r.stops', { n: tp.travels }) : tp.retraces && print.latticeRetrace === 'off' ? t('r.noJumps') : t('r.noStops')) + (tp.partChanges ? ' ' + t('r.partChanges', { n: tp.partChanges }) : '') + (tp.retraces ? ' ' + t(print.latticeRetrace === 'print' ? 'r.retracesPrint' : print.latticeRetrace === 'side' ? 'r.retracesSide' : 'r.retraces', { n: tp.retraces }) : '');
   const items: [string, string, boolean?][] = [
     [t('r.mode'), t(`r.mode.${tp.mode}`) + stops, true],
     [t('r.layers'), `${tp.layerCount}`],

@@ -261,7 +261,6 @@ test('supports in their own program: the simulation plays the real change of pro
   ]);
   await page.setInputFiles('#file', { name: 'croce.stl', mimeType: 'model/stl', buffer: jack });
   await expect(download(page)).toBeVisible();
-  await page.locator('#printFields label').filter({ hasText: 'Curve che seguono' }).locator('input').uncheck();
   await field(page, 'Supporti').selectOption('separate');
   await expect(page.locator('#downloadSup')).toBeVisible();
   // the first point of the part program, found by scrubbing the slider
@@ -314,5 +313,44 @@ test('a thin wall is printed along its middle, one pass per layer', async ({ pag
   const metres = parseFloat((await stat(page, 'Lunghezza stampa').innerText()).replace(',', '.'));
   expect(metres).toBeLessThan(0.9);
   await expect(page.locator('#printFields')).toContainText('Reticoli');
+});
+
+test('three print types; the contour is laid automatically or as chosen', async ({ page }) => {
+  await addPart(page, 'blocco.stl');
+  await expect(download(page)).toBeEnabled();
+  const mode = field(page, 'Modo di stampa');
+  await expect(mode.locator('option')).toHaveText([/^Contorno/, /^Riempimento/, /^Superficie/]);
+  const strategy = field(page, 'Contorno: come stenderlo');
+  await expect(strategy).toHaveValue('auto');
+  await strategy.selectOption('spiral');
+  await expect(stat(page, 'Modo scelto')).toContainText('Contorno a spirale');
+  await strategy.selectOption('auto');
+  await expect(stat(page, 'Modo scelto')).toContainText('Contorno a strati');
+});
+
+test('a stretch of the path can be changed by hand, and undone', async ({ page }) => {
+  await addPart(page, 'blocco.stl');
+  await expect(download(page)).toBeEnabled();
+  const points = async () => parseInt((await stat(page, 'Punti LIN').innerText()).replace(/\D/g, ''), 10);
+  const before = await points();
+  await page.locator('#editToggle').click();
+  await page.locator('#editFrom').fill('5');
+  await page.locator('#editTo').fill('7');
+  await page.locator('#editDelete').click();
+  await expect(page.locator('#warnings')).toContainText('Percorso modificato a mano');
+  await expect(page.locator('#editCount')).toContainText('1 modifiche');
+  expect(await points()).toBe(before - 3);
+  // the edited program is still checked: it can be downloaded only if the checks pass
+  await expect(page.locator('#exportState li')).toHaveCount(0);
+  await page.locator('#editUndo').click();
+  await expect(page.locator('#warnings')).not.toContainText('Percorso modificato a mano');
+  expect(await points()).toBe(before);
+  // a change of settings discards the edits, and says so
+  await page.locator('#editFrom').fill('5');
+  await page.locator('#editTo').fill('5');
+  await page.locator('#editOff').click();
+  await expect(page.locator('#warnings')).toContainText('Percorso modificato a mano');
+  await setField(page, 'Altezza strato', '2');
+  await expect(page.locator('#warnings')).toContainText('le modifiche fatte a mano non valgono più');
 });
 

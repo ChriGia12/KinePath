@@ -17,6 +17,13 @@ export interface PrintSettings {
    */
   adaptiveLayers: boolean;
   /**
+   * Contour print (`mode: 'planar'`): how it is laid. 'auto' chooses from the part (strategy.ts);
+   * 'layers' flat layers with a ramp, 'spiral' vase mode, 'rings' rings following the surface.
+   */
+  contourStrategy: 'auto' | 'layers' | 'spiral' | 'rings';
+  /** Way round every closed loop is printed, seen from above. */
+  loopDirection: 'ccw' | 'cw';
+  /**
    * Removable supports under what hangs in the air (the mesh is never changed): none, printed in
    * the same program layer by layer, or in a separate program printed before the part.
    */
@@ -35,10 +42,11 @@ export interface PrintSettings {
   overhangAngle: number; // deg from vertical considered critical
   thinWallMax: number; // mm, hollow shells up to this thickness print as one mid-line (0 = off)
   /**
-   * Thin-walled networks (honeycomb, grid): a wall the single walk must pass a second time is
-   * passed with the extruder off ('off', nothing is laid twice) or printed again ('print').
+   * Thin-walled networks (honeycomb, grid): a wall the single walk must pass twice gets its two
+   * passes side by side ('side', two beads wide there), or the second pass with the extruder off
+   * ('off', nothing laid twice), or printed over the first ('print').
    */
-  latticeRetrace: 'off' | 'print';
+  latticeRetrace: 'side' | 'off' | 'print';
   /** 'auto': start at the front-left of the part; 'point': start at the contour point nearest (startX, startY) in BASE. */
   fillAngle: number; // deg, direction of serpentine passes in plan
   fillAlternate: boolean; // turn passes 90° on every other layer / pass
@@ -108,6 +116,8 @@ export const DEFAULT_PRINT: PrintSettings = {
   layerHeight: 1.5,
   layerRamp: 20,
   adaptiveLayers: false,
+  contourStrategy: 'auto',
+  loopDirection: 'ccw',
   supports: 'none',
   baseCut: 0,
   firstLayerZ: 0.5,
@@ -121,7 +131,7 @@ export const DEFAULT_PRINT: PrintSettings = {
   travelLift: 10,
   overhangAngle: 45,
   thinWallMax: 10,
-  latticeRetrace: 'off',
+  latticeRetrace: 'side',
   fillAngle: 0,
   fillAlternate: true,
   fillAutoAngle: true,

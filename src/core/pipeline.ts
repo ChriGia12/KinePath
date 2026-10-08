@@ -11,6 +11,8 @@ import { boxesOverlap, joinInTurn, printPartsInTurn, type PartBox } from './part
 import { tiltAlongWalls } from './tilt';
 import { evaluateOrientation, OVERHANG_LIMIT, supportOk } from './orientation';
 import { collisionReport, type Body, type CollisionReport } from './collision';
+import { applyEdits, pathSignature, type PathEdits } from './edits';
+import { resolveStrategy } from './strategy';
 
 export interface BuildResult {
   toolpath: Toolpath;
@@ -35,6 +37,11 @@ export interface BuildResult {
   zones: Zones;
   /** Arm / mandrino against plate and printed part (null when the cell bodies are not given). */
   collision: CollisionReport | null;
+  /** Signature of the path as computed (before any change made by hand). */
+  baseSig: string;
+  /** Changes made by hand applied to the path; `editsDropped`: they no longer fitted it. */
+  edited: number;
+  editsDropped: boolean;
 }
 
 /** Where the local part frame lands in BASE coordinates. */
@@ -59,6 +66,8 @@ export function runBuild(
   bodies?: Body[],
   /** Several parts: their footprints in BASE, in printing order (one part after the other). */
   partBoxes?: PartBox[],
+  /** Changes made by hand to the path (edits.ts): applied only to the path they were made on. */
+  edits?: PathEdits,
 ): BuildResult {
   // Parameters are checked before any geometry: an out-of-range value (e.g. thousands of passes)
   // must not start a computation that could take minutes or exhaust memory.
@@ -70,10 +79,14 @@ export function runBuild(
   const offset = placementOffset(original, robot);
   const start: [number, number] | undefined =
     print.startMode === 'point' ? [print.startX - offset[0], print.startY - offset[1]] : undefined;
+  const multi = !!partBoxes && partBoxes.length > 1;
+  // A contour print without an explicit choice: how to lay it is decided from the part (with
+  // several parts, each part decides for itself in buildToolpath).
+  const choice = multi ? null : resolveStrategy(mesh, print);
+  if (choice) print = choice.settings;
   const summary = print.mode === 'surface' ? undefined : sliceForPrint(mesh, print);
   // Supports in a separate program: the part and the supports become two paths, printed one
   // after the other (supports first). Not with several parts or rings following the surface.
-  const multi = !!partBoxes && partBoxes.length > 1;
   const wantSeparate = print.supports === 'separate';
   const separate = wantSeparate && !multi && !!summary && summary.supportLayers > 0 && !(print.adaptiveLayers && (print.mode === 'planar' || print.mode === 'spiral'));
   let toolpath: Toolpath;
@@ -94,11 +107,25 @@ export function runBuild(
     toolpath = multi ? printPartsInTurn(mesh, print, partBoxes!, offset, start) : buildToolpath(mesh, print, summary, start);
     if (wantSeparate && summary?.supportLayers) toolpath.warnings.push(msg('w.supportsInline'));
   }
+  if (choice?.why) toolpath.warnings.push(choice.why);
   if (print.baseCut > 0) toolpath.warnings.push(msg('w.baseCut', { z: print.baseCut }));
   const zones = riskZones(mesh, summary?.layers ?? null, print);
   const placed: RobotSettings = { ...robot, originX: offset[0], originY: offset[1], originZ: offset[2] };
   // Tool leaning along the walls (every mode but the surface one, which has its own tilt).
   if (print.toolTilt && toolpath.mode !== 'surface') tiltAlongWalls(toolpath, mesh, print);
+  // Changes made by hand: only on the very path they were made on, and before every check.
+  const baseSig = pathSignature(toolpath);
+  let edited = 0;
+  let editsDropped = false;
+  if (edits?.edits.length) {
+    if (partPath || edits.sig !== baseSig) {
+      editsDropped = true;
+      toolpath.warnings.push(msg(partPath ? 'w.editsSeparate' : 'w.editsDropped'));
+    } else {
+      edited = applyEdits(toolpath, edits.edits);
+      if (edited) toolpath.warnings.push(msg('w.edited', { n: edited }));
+    }
+  }
   const src = writeKukaSrc(partPath ?? toolpath, placed, { sourceName, layerHeight: print.layerHeight });
   const supportSrc = supportPath?.points.length
     ? writeKukaSrc(supportPath, { ...placed, programName: supportProgramName(robot.programName) }, { sourceName, layerHeight: print.layerHeight })
@@ -162,5 +189,5 @@ export function runBuild(
       errors.push(msg('v.collision', { n: collision.count, lin: collision.first + 1, what: `c.${collision.what}`, body: collision.body }));
     for (const c of collision.ptp) errors.push(msg('v.ptpCollision', { move: `c.move.${c.move}`, what: `c.${c.what}`, body: c.body }));
   }
-  return { toolpath, src, supportSrc, offset, mesh, min, max, reach, errors, offBed, support, zones, collision };
+  return { toolpath, src, supportSrc, offset, mesh, min, max, reach, errors, offBed, support, zones, collision, baseSig, edited, editsDropped };
 }

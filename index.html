@@ -176,6 +176,34 @@
             <input type="range" id="simSlider" min="0" max="0" value="0" aria-label="Movimento LIN" data-i18n-aria="sim.slider" />
           </div>
           <div id="simReadout" class="sim-readout">–</div>
+          <div class="edit" id="editBox">
+            <button class="ghost small" id="editToggle" title="Cambia a mano un tratto del percorso" data-i18n="edit.toggle" data-i18n-title="edit.toggle.title">Modifica percorso</button>
+            <span id="editCount" class="pick-hint"></span>
+            <div id="editPanel" class="edit-panel" hidden>
+              <div class="edit-row">
+                <span data-i18n="edit.from">Da LIN</span>
+                <input type="number" id="editFrom" min="1" step="1" />
+                <button class="ghost small" id="editFromHere" data-i18n="edit.here">qui</button>
+                <span data-i18n="edit.to">a LIN</span>
+                <input type="number" id="editTo" min="1" step="1" />
+                <button class="ghost small" id="editToHere" data-i18n="edit.here">qui</button>
+              </div>
+              <div class="edit-row">
+                <button class="ghost small" id="editOff" data-i18n="edit.off">Estrusore spento</button>
+                <button class="ghost small" id="editOn" data-i18n="edit.on">Estrusore acceso</button>
+                <button class="ghost small" id="editDelete" data-i18n="edit.delete">Elimina punti</button>
+                <span>ΔX</span><input type="number" id="editDx" value="0" step="any" />
+                <span>ΔY</span><input type="number" id="editDy" value="0" step="any" />
+                <span>ΔZ</span><input type="number" id="editDz" value="0" step="any" />
+                <button class="ghost small" id="editShift" data-i18n="edit.shift">Sposta</button>
+              </div>
+              <div class="edit-row">
+                <button class="ghost small" id="editUndo" data-i18n="edit.undo" disabled>Annulla ultima</button>
+                <button class="ghost small" id="editClear" data-i18n="edit.clear" disabled>Togli tutte</button>
+                <span class="hint" data-i18n="edit.hint">Il tratto va dal LIN di inizio a quello di fine (il cursore sopra mostra il numero). Dopo ogni modifica il percorso viene ricontrollato; se cambi un'impostazione le modifiche a mano si perdono.</span>
+              </div>
+            </div>
+          </div>
           <label><span data-i18n="vp.layer">Strato</span> <output id="layerOut">–</output>
             <input type="range" id="layerSlider" min="0" max="0" value="0" />
           </label>

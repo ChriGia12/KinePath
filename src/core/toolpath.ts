@@ -8,6 +8,7 @@ import { cFromNormal, HeightField, topSurfacePasses, type SurfaceOptions, type S
 import { sliceAt, type Contour, type Layer } from './slicer';
 import { buildWalls, collapseThinWalls, coverContours, islands, offsetContours } from './walls';
 import { collapseLattices } from './lattice';
+import { resolveStrategy } from './strategy';
 import { scanFill, serpentine } from './zigzag';
 import { buildRings } from './rings';
 import { addSupports } from './supports';
@@ -147,6 +148,13 @@ export function buildToolpath(
   /** Seam target in the mesh's own frame; defaults to the front-left corner. */
   startTarget?: Vec2,
 ): Toolpath {
+  // A contour print without an explicit choice: how to lay it is decided from the part.
+  const chosen = resolveStrategy(mesh, s);
+  if (chosen.settings !== s) {
+    const tp = buildToolpath(mesh, chosen.settings, chosen.settings.mode === s.mode && !chosen.settings.adaptiveLayers ? summaryIn : undefined, startTarget);
+    if (chosen.why) tp.warnings.push(chosen.why);
+    return tp;
+  }
   const b0 = computeBounds(mesh);
   if (s.mode === 'surface') return buildSurface(mesh, s, startTarget ?? [b0.min[0], b0.min[1]]);
   // Contour layers / spiral following the surface: rings at a constant bead distance (rings.ts).
@@ -162,7 +170,7 @@ export function buildToolpath(
   if (summary.emptyLayers) warnings.push(msg('w.emptyLayers', { n: summary.emptyLayers }));
   if (summary.dropped) warnings.push(msg('w.dropped', { n: summary.dropped, mm: s.minContourLength }));
   if (summary.supportLayers) warnings.push(msg('w.supports', { n: summary.supportLayers }));
-  if (summary.latticeLayers) warnings.push(msg(s.latticeRetrace === 'print' ? 'w.latticePrint' : 'w.lattice', { n: summary.latticeLayers }));
+  if (summary.latticeLayers) warnings.push(msg('w.lattice', { n: summary.latticeLayers }));
 
   const b = computeBounds(mesh);
   const start: Vec2 = startTarget ?? [b.min[0], b.min[1]];
@@ -201,8 +209,10 @@ function push(tp: Toolpath, p: PathPoint) {
 }
 
 function prepareLoop(c: Contour, s: PrintSettings, near: Vec2): Vec2[] {
-  // Every loop is printed the same way round (counter-clockwise from above), holes included.
-  const simple = simplifyClosed(signedArea(c.pts) < 0 ? [...c.pts].reverse() : c.pts, s.tolerance);
+  // Every loop is printed the same way round (counter-clockwise from above unless set otherwise),
+  // holes included.
+  const ccw = signedArea(c.pts) < 0 ? [...c.pts].reverse() : c.pts;
+  const simple = simplifyClosed(s.loopDirection === 'cw' ? [...ccw].reverse() : ccw, s.tolerance);
   return densify(rotateToNearest(simple, near), s.maxSegment, true);
 }
 
@@ -408,10 +418,13 @@ export function buildPlanar(tp: Toolpath, layers: Layer[], s: PrintSettings, sta
 }
 
 /**
- * The walk along a thin-walled network: one continuous move at the layer height. A wall the walk
- * already passed in this layer is passed again without lifting, with the extruder off (or printed
- * again, `latticeRetrace`). The walk starts from its end nearest to the nozzle, so on the next
- * layer it runs back from where this one ended, right above it.
+ * The walk along a thin-walled network: one continuous move at the layer height, started from its
+ * end nearest to the nozzle, so on the next layer it runs back from where this one ended, right
+ * above it. A wall the walk must pass twice (`latticeRetrace`):
+ *  - 'side': the two passes are laid side by side, half a bead each side of the mid-line — the
+ *    extruder never stops and no bead lies on another (that wall comes out two beads wide);
+ *  - 'off': the second pass is made with the extruder off, without lifting;
+ *  - 'print': the second pass is printed over the first.
  */
 function printLattice(tp: Toolpath, c: Contour, z: number, s: PrintSettings, cur: Vec2, inside: Inside): Vec2 {
   let pts = c.pts;
@@ -420,29 +433,84 @@ function printLattice(tp: Toolpath, c: Contour, z: number, s: PrintSettings, cur
     const loop = rotateToNearest(pts.slice(0, -1), cur);
     pts = [...loop, loop[0]];
   } else if (Math.hypot(pts[pts.length - 1][0] - cur[0], pts[pts.length - 1][1] - cur[1]) < Math.hypot(pts[0][0] - cur[0], pts[0][1] - cur[1])) pts = [...pts].reverse();
-  const last = tp.points[tp.points.length - 1];
-  const hop = last ? Math.hypot(pts[0][0] - last.x, pts[0][1] - last.y) : Infinity;
-  if (last && z > last.z && hop <= Math.max(s.wallSpacing, s.maxBridge)) {
-    // On top of where the layer below ended: straight up, then on along the walk.
-    if (hop > 1e-6) push(tp, { x: pts[0][0], y: pts[0][1], z: last.z, e: true });
-    push(tp, { x: pts[0][0], y: pts[0][1], z, e: true });
-  } else moveTo(tp, pts[0], z, s, undefined, inside, true); // on the layer below: as long as a serpentine link
   const key = (a: Vec2, b: Vec2) => {
     const [p, q] = a[0] < b[0] || (a[0] === b[0] && a[1] <= b[1]) ? [a, b] : [b, a];
     return `${p[0].toFixed(3)},${p[1].toFixed(3)},${q[0].toFixed(3)},${q[1].toFixed(3)}`;
   };
-  const done = new Set<string>();
-  let again = false;
-  for (let i = 1; i < pts.length; i++) {
-    const k = key(pts[i - 1], pts[i]);
-    const repeat = done.has(k);
-    done.add(k);
-    if (repeat && !again) tp.retraces = (tp.retraces ?? 0) + 1;
-    again = repeat;
-    const e = !repeat || s.latticeRetrace === 'print';
-    for (const q of densify([pts[i - 1], pts[i]], s.maxSegment, false).slice(1)) push(tp, { x: q[0], y: q[1], z, e });
+  const n = pts.length;
+  const keys = pts.map((q, i) => (i ? key(pts[i - 1], q) : ''));
+  const total = new Map<string, number>();
+  for (let i = 1; i < n; i++) total.set(keys[i], (total.get(keys[i]) ?? 0) + 1);
+  // For every segment: is it the second pass over its wall, and (side by side) where it is laid.
+  const seen = new Map<string, Vec2>();
+  const repeat: boolean[] = [false];
+  const shift: (Vec2 | null)[] = [null];
+  for (let i = 1; i < n; i++) {
+    const d: Vec2 = [pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]];
+    const len = Math.hypot(d[0], d[1]) || 1;
+    const first = seen.get(keys[i]);
+    repeat.push(!!first);
+    if (!first) seen.set(keys[i], d);
+    if (s.latticeRetrace !== 'side' || (total.get(keys[i]) ?? 0) < 2) {
+      shift.push(null);
+      continue;
+    }
+    // Keep left; a second pass in the same direction as the first keeps right.
+    const same = !!first && first[0] * d[0] + first[1] * d[1] > 0;
+    const sign = same ? -1 : 1;
+    shift.push([(-d[1] / len) * sign, (d[0] / len) * sign]);
   }
-  return pts[pts.length - 1];
+  // Where each pass is laid: on the mid-line, or half a bead beside it (corners mitred).
+  const half = s.wallSpacing / 2;
+  const out: { p: Vec2; e: boolean }[] = [];
+  for (let i = 1; i < n; i++) {
+    const e = !repeat[i] || s.latticeRetrace !== 'off';
+    const sh = shift[i];
+    if (!sh) {
+      if (!out.length) out.push({ p: pts[i - 1], e: false });
+      // After a pass laid beside the mid-line: back onto the junction first, so this wall is straight.
+      else if (shift[i - 1]) out.push({ p: pts[i - 1], e: true });
+      out.push({ p: pts[i], e });
+      continue;
+    }
+    const at = (v: number, other: Vec2 | null): Vec2 => {
+      // Vertex shared with the next/previous segment of the same run: average of the two normals.
+      let nx = sh[0];
+      let ny = sh[1];
+      if (other) {
+        const [mx, my] = [sh[0] + other[0], sh[1] + other[1]];
+        const m = Math.hypot(mx, my);
+        if (m > 0.2) {
+          const k = Math.min(2, 2 / m); // mitre length 1 / cos(half angle), at most 2
+          [nx, ny] = [(mx / m) * k, (my / m) * k];
+        }
+      }
+      return [pts[v][0] + nx * half, pts[v][1] + ny * half];
+    };
+    const prevRun = i > 1 && shift[i - 1] && repeat[i - 1] === repeat[i] ? shift[i - 1] : null;
+    const nextRun = i < n - 1 && shift[i + 1] && repeat[i + 1] === repeat[i] ? shift[i + 1] : null;
+    const a = at(i - 1, prevRun);
+    if (!out.length) out.push({ p: a, e: false });
+    else if (!prevRun) out.push({ p: a, e: true }); // the short step from the mid-line onto the side
+    out.push({ p: at(i, nextRun), e: true });
+  }
+  if (!out.length) return cur;
+  const last = tp.points[tp.points.length - 1];
+  const start = out[0].p;
+  const hop = last ? Math.hypot(start[0] - last.x, start[1] - last.y) : Infinity;
+  if (last && z > last.z && hop <= Math.max(s.wallSpacing, s.maxBridge)) {
+    // On top of where the layer below ended: straight up, then on along the walk.
+    if (hop > 1e-6) push(tp, { x: start[0], y: start[1], z: last.z, e: true });
+    push(tp, { x: start[0], y: start[1], z, e: true });
+  } else moveTo(tp, start, z, s, undefined, inside, true); // on the layer below: as long as a serpentine link
+  let again = false;
+  for (let i = 1; i < n; i++) {
+    if (repeat[i] && !again) tp.retraces = (tp.retraces ?? 0) + 1;
+    again = repeat[i];
+  }
+  for (let k = 1; k < out.length; k++)
+    for (const q of densify([out[k - 1].p, out[k].p], s.maxSegment, false).slice(1)) push(tp, { x: q[0], y: q[1], z, e: out[k].e });
+  return out[out.length - 1].p;
 }
 
 /** Vase mode: Z rises continuously along each contour, so there is no seam and no stop. */
